@@ -53,7 +53,7 @@ export class Board {
         `translate(${this.mount.scrollLeft}px, ${this.mount.scrollTop}px)`;
     };
 
-    // Konva: single Layer + world group (so camera transform applies to all)
+    // Konva: one Layer + world group (camera transform applies to all)
     this.stage = new Konva.Stage({
       container: this.stageHost,
       width: this.stageHost.clientWidth,
@@ -83,12 +83,25 @@ export class Board {
       this.groups.pins
     );
 
+    // Single transformer added to the same transformed "world"
+    this.tr = new Konva.Transformer({
+      rotateEnabled: true,
+      boundBoxFunc: (oldBox, newBox) => {
+        const minW = 80, minH = 60;
+        if (newBox.width < minW || newBox.height < minH) return oldBox;
+        return newBox;
+      }
+    });
+    this.world.add(this.tr);
+    this.tr.moveToTop();
+
     // world visuals
     this._buildWorld();
 
     // models + nodes
     this.SHAPES = new Map();      // id -> model
     this.SHAPE_NODES = new Map(); // id -> Konva.Group
+    this.selectedId = null;
 
     // hooks
     this.Hooks = {
@@ -130,70 +143,33 @@ export class Board {
       this._animateZoomTo(this.zoom * factor, anchorWorld, ptr);
     });
 
-// --- left-click pan with movement threshold (prevents snap when dragging cards) ---
-this.isPanning = false;
-this.panStart = null;
-this.scrollStart = null;
-this.panCandidate = null;
-this.PAN_THRESHOLD = 5; // pixels
+    // left-click pan when not on a shape/transformer
+    this.isPanning = false; this.panStart = null; this.scrollStart = null;
+    this.stage.on('mousedown', (e) => {
+      // don't pan if we're on a transformer handle
+      const parent = e.target && e.target.getParent && e.target.getParent();
+      const isTransformerHandle = !!(parent && parent.getClassName && parent.getClassName() === 'Transformer');
+      if (isTransformerHandle) return;
 
-this.stage.on('mousedown', (e) => {
-  if (e.evt.button !== 0) return; // left only
-  // If the click is on a shape, let Konva's drag logic take over.
-  if (this._isOnShape(e.target)) return;
-
-  // Not on a shape: mark as a pan candidate but don't start yet.
-  const p = this.stage.getPointerPosition();
-  if (!p) return;
-  this.panCandidate = { x: p.x, y: p.y };
-  this.scrollStart = { left: this.mount.scrollLeft, top: this.mount.scrollTop };
-});
-
-this.stage.on('mousemove', () => {
-  const p = this.stage.getPointerPosition();
-  if (!p) return;
-
-  // If we're actively panning, apply deltas to scroll.
-  if (this.isPanning && this.panStart) {
-    const dx = p.x - this.panStart.x;
-    const dy = p.y - this.panStart.y;
-    this.suppressScrollSync = true;
-    this.mount.scrollLeft = this.scrollStart.left - dx;
-    this.mount.scrollTop  = this.scrollStart.top  - dy;
-    this.pinOverlayToScroll();
-    this.suppressScrollSync = false;
-    return;
-  }
-
-  // If we only have a candidate, see if we've moved far enough to start a pan.
-  if (this.panCandidate) {
-    const dx = p.x - this.panCandidate.x;
-    const dy = p.y - this.panCandidate.y;
-    if ((dx*dx + dy*dy) >= (this.PAN_THRESHOLD * this.PAN_THRESHOLD)) {
-      // Promote to real pan
-      this.isPanning = true;
-      this.panStart = { x: this.panCandidate.x, y: this.panCandidate.y };
-      this.stage.container().style.cursor = 'grabbing';
-      this.mount.style.userSelect = 'none';
-      // keep existing scrollStart
-    }
-  }
-});
-
-const cancelPanGesture = () => {
-  this.isPanning = false;
-  this.panStart = null;
-  this.panCandidate = null;
-  this.scrollStart = null;
-  this.stage.container().style.cursor = '';
-  this.mount.style.userSelect = '';
-};
-
-this.stage.on('mouseup', cancelPanGesture);
-this.stage.on('mouseleave', cancelPanGesture);
-
-// If a drag actually starts (e.g., you grabbed a card), cancel any pan-in-progress/candidate.
-this.stage.on('dragstart', () => { cancelPanGesture(); });
+      if (e.evt.button !== 0) return;         // only left
+      if (this._isOnShape(e.target)) return;  // let shapes drag/transform
+      this._startPanAtPointer();
+    });
+    this.stage.on('dragstart', () => { if (this.isPanning) this._endPan(); });
+    this.stage.on('mouseup',   () => this._endPan());
+    this.stage.on('mouseleave',() => this._endPan());
+    this.stage.on('mousemove', () => {
+      if (!this.isPanning || !this.panStart) return;
+      const p = this.stage.getPointerPosition();
+      if (!p) return;
+      const dx = p.x - this.panStart.x;
+      const dy = p.y - this.panStart.y;
+      this.suppressScrollSync = true;
+      this.mount.scrollLeft = this.scrollStart.left - dx;
+      this.mount.scrollTop  = this.scrollStart.top  - dy;
+      this.pinOverlayToScroll();
+      this.suppressScrollSync = false;
+    });
 
     // resize + initial center
     new ResizeObserver(() => this._resizeStageToViewport()).observe(this.mount);
@@ -210,7 +186,7 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
     // Sort by z (undefined -> 0) so we create back->front
     const sorted = [...arr].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
     const incoming = new Set(sorted.map(s => s.id));
-    sorted.forEach(s => this._upsertCard(s));   // (cards only in this phase)
+    sorted.forEach(s => this._upsertCard(s));
     // remove missing
     this.SHAPE_NODES.forEach((_, id) => { if (!incoming.has(id)) this._removeShape(id); });
     this.layer.batchDraw();
@@ -308,20 +284,16 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
     const nodes = this.groups.cards.getChildren(n => n.hasName('shape') && n.getAttr('shapeKind') === 'card');
     return nodes.map((n, idx) => ({ id: n.getAttr('shapeId'), z: idx }));
   }
-
   _normalizeAndEmitCardOrder() {
     const order = this.getCardOrder(); // dense, back->front
-    // update in-memory models
     order.forEach(({id, z}) => {
       const m = this.SHAPES.get(id);
       if (m) m.z = z;
     });
-    // emit hook for persistence
     this.Hooks.onZOrderChange?.(order);
   }
 
   getCards() {
-    // return models in draw order (using groups.cards children)
     const nodes = this.groups.cards.getChildren(n => n.hasName('shape') && n.getAttr('shapeKind') === 'card');
     return nodes.map(n => this.SHAPES.get(n.getAttr('shapeId'))).filter(Boolean);
   }
@@ -403,7 +375,7 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
     }
   }
 
-  // -- NEW: build/replace the styled body+header via cardStyles.js --
+  // build/replace the styled body+header via cardStyles.js
   _buildCardSkin(node, model) {
     const styleFn = cardStyles[model.styleKey] || cardStyles.default;
 
@@ -416,14 +388,13 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
       headerFill: model.headerFill ?? '#0f1317',
     };
 
-    // create skin (Group named 'cardGroup', containing .body + .header)
-    const skin = styleFn(safeStyle);
+    const skin = styleFn(safeStyle); // Group with .body + .header
     skin.name('cardGroup');
+
     // apply shadow on body
-    const body = skin.findOne('.body');
+    const body = skin.findOne('.body'); // Remove if Scale Patch works 
     if (body) this._applyShadowToBody(body);
 
-    // insert skin first (bottom)
     node.add(skin);
 
     // ensure title & image nodes exist (or create them)
@@ -431,40 +402,28 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
     let img   = node.findOne('.img');
     let frame = node.findOne('.imgFrame');
 
-    const header = skin.findOne('.header');
+    const header = skin.findOne('.header');// Remove if Scale Patch works 
     const headerH = header?.height() ?? 26;
     const imgSize = 70;
     const imgX = 12;
     const imgY = headerH + 10;
 
     if (!img) {
-      img = new Konva.Image({
-        name: 'img',
-        x: imgX, y: imgY, width: imgSize, height: imgSize,
-        listening: false, visible: false
-      });
+      img = new Konva.Image({ name: 'img', x: imgX, y: imgY, width: imgSize, height: imgSize, listening: false, visible: false });
       node.add(img);
     } else {
-      img.position({ x: imgX, y: imgY });
-      img.size({ width: imgSize, height: imgSize });
+      img.position({ x: imgX, y: imgY }); img.size({ width: imgSize, height: imgSize });
     }
 
     if (!frame) {
       frame = new Konva.Rect({
         name: 'imgFrame',
         x: imgX, y: imgY, width: imgSize, height: imgSize,
-        cornerRadius: 6,
-        stroke: '#2d3741',
-        strokeWidth: 1,
-        listening: false
+        cornerRadius: 6, stroke: '#2d3741', strokeWidth: 1, fill: false
       });
-      frame.fillEnabled(false); // border-only so it never hides the image
       node.add(frame);
     } else {
-      frame.position({ x: imgX, y: imgY });
-      frame.size({ width: imgSize, height: imgSize });
-      frame.fillEnabled(false);
-      frame.listening(false);
+      frame.position({ x: imgX, y: imgY }); frame.size({ width: imgSize, height: imgSize }); frame.fillEnabled(false);
     }
 
     if (!title) {
@@ -477,18 +436,13 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
       });
       node.add(title);
     } else {
-      title.position({ x: 12, y: 6 });
-      title.width(model.w - 24);
-      title.height(headerH - 8);
+      title.position({ x: 12, y: 6 }); title.width(model.w - 24); title.height(headerH - 8);
       title.text(model.title ?? model.id);
     }
 
-    // Keep draw order clear: skin (bottom) -> frame -> img -> title
-    // (frame has no fill, so even if above img it won’t hide it)
-    skin.zIndex(0);
-    frame.zIndex(1);
-    img.zIndex(2);
-    title.zIndex(3);
+    // keep draw order: cardGroup (skin) -> img -> frame -> title
+    skin.moveToBottom();
+    img.moveToTop(); frame.moveToTop(); title.moveToTop();
 
     // (re)load image if URL present
     this._setCardImage(node, model.img);
@@ -498,6 +452,12 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
     const old = node.findOne('.cardGroup');
     if (old) old.destroy();
     this._buildCardSkin(node, model);
+
+    // keep selection/transformer after rebuild if this node is selected
+    if (this.tr && this.selectedId === model.id) {
+      this.tr.nodes([node]);
+      this.tr.getLayer()?.batchDraw();
+    }
   }
 
   _upsertCard(model) {
@@ -547,28 +507,35 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
         return { x: p.cx, y: p.cy };
       });
 
+      // bring to top while dragging; update inspector
       node.on('dragstart', () => {
-        // bring to front immediately
         node.moveToTop();
         this.layer.batchDraw();
-        const ok = this.Hooks.onDragStart(next.id, { cx: next.cx, cy: next.cy });
+        const ok = this.Hooks.onDragStart(next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
         if (ok === false) { node.stopDrag(); return; }
       });
-
       node.on('dragmove', () => {
         const p = this._clampCardCenter(node.x(), node.y(), next.w, next.h);
         node.position({ x: p.cx, y: p.cy });
         next.cx = p.cx; next.cy = p.cy;
-        this.Hooks.onDrag(next.id, { cx: next.cx, cy: next.cy });
+        this.Hooks.onDrag(next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
       });
-
       node.on('dragend', () => {
         const p = this._clampCardCenter(node.x(), node.y(), next.w, next.h);
         node.position({ x: p.cx, y: p.cy });
         next.cx = p.cx; next.cy = p.cy;
-        this.Hooks.onDragEnd(next.id, { cx: next.cx, cy: next.cy });
-        // Normalize and emit order for persistence
+        this.Hooks.onDragEnd(next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
         this._normalizeAndEmitCardOrder();
+      });
+
+      // Select immediately on press; stop bubbling so stage doesn't pan/clear
+      node.on('mousedown touchstart', (e) => {
+        this.selectCard(next.id);
+        e.cancelBubble = true;
+      });
+      node.on('click tap', (e) => {
+        this.selectCard(next.id);
+        e.cancelBubble = true;
       });
 
       this.groups.cards.add(node);
@@ -593,22 +560,71 @@ this.stage.on('dragstart', () => { cancelPanGesture(); });
         node.offset({ x: next.w/2, y: next.h/2 });
         this._rebuildCardSkin(node, next);
       } else {
-        // minor updates
         const title = node.findOne('.title');
         if (title && next.title != null) title.text(next.title);
-        // if image URL changed, reload
         this._setCardImage(node, next.img);
       }
 
-      // z update if requested
       if (typeof next.z === 'number') node.zIndex(next.z);
     }
+  }
+
+  // Public: select a card, attach transformer, stream inspector updates, commit on end
+  selectCard(id) {
+    const node = this.SHAPE_NODES.get(id);
+    if (!node) return;
+    this.selectedId = id;
+
+    // attach transformer
+    this.tr.nodes([node]);
+    this.tr.getLayer()?.batchDraw();
+
+    // live inspector values while resizing/rotating
+    node.off('transform.board');
+    node.on('transform.board', () => {
+      const m = this.SHAPES.get(id);
+      if (!m) return;
+      const w = Math.round((m.w ?? 300) * node.scaleX());
+      const h = Math.round((m.h ?? 150) * node.scaleY());
+      const rot = Math.round(node.rotation());
+      this.Hooks.onDrag?.(id, { cx: m.cx, cy: m.cy, w, h, rot });
+    });
+
+    // commit w/h/rot on transform end (avoid snap-back)
+    node.off('transformend.board');
+    node.on('transformend.board', () => {
+      const m = this.SHAPES.get(id);
+      if (!m) return;
+
+      const newW = Math.max(80, (m.w ?? 300) * node.scaleX());
+      const newH = Math.max(60, (m.h ?? 150) * node.scaleY());
+      const newRot = node.rotation();
+
+      m.w = newW;
+      m.h = newH;
+      m.rot = newRot;
+
+      node.scale({ x: 1, y: 1 });
+      node.offset({ x: newW / 2, y: newH / 2 });
+
+      this._rebuildCardSkin(node, m);
+
+      this.tr.nodes([node]);
+      this.tr.getLayer()?.batchDraw();
+
+      this.Hooks.onDragEnd?.(id, { cx: m.cx, cy: m.cy, w: m.w, h: m.h, rot: m.rot });
+    });
   }
 
   _removeShape(id) {
     this.SHAPES.delete(id);
     const node = this.SHAPE_NODES.get(id);
     if (node) { node.destroy(); this.SHAPE_NODES.delete(id); }
+    if (this.selectedId === id) {
+      this.selectedId = null;
+      this.tr.nodes([]);
+      this.tr.getLayer()?.batchDraw();
+    }
   }
 
   // camera + UI
