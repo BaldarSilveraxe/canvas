@@ -130,28 +130,70 @@ export class Board {
       this._animateZoomTo(this.zoom * factor, anchorWorld, ptr);
     });
 
-    // left-click pan when not on a shape
-    this.isPanning = false; this.panStart = null; this.scrollStart = null;
-    this.stage.on('mousedown', (e) => {
-      if (e.evt.button !== 0) return;         // only left
-      if (this._isOnShape(e.target)) return;  // let shapes drag
-      this._startPanAtPointer();
-    });
-    this.stage.on('dragstart', () => { if (this.isPanning) this._endPan(); });
-    this.stage.on('mouseup',   () => this._endPan());
-    this.stage.on('mouseleave',() => this._endPan());
-    this.stage.on('mousemove', () => {
-      if (!this.isPanning || !this.panStart) return;
-      const p = this.stage.getPointerPosition();
-      if (!p) return;
-      const dx = p.x - this.panStart.x;
-      const dy = p.y - this.panStart.y;
-      this.suppressScrollSync = true;
-      this.mount.scrollLeft = this.scrollStart.left - dx;
-      this.mount.scrollTop  = this.scrollStart.top  - dy;
-      this.pinOverlayToScroll();
-      this.suppressScrollSync = false;
-    });
+// --- left-click pan with movement threshold (prevents snap when dragging cards) ---
+this.isPanning = false;
+this.panStart = null;
+this.scrollStart = null;
+this.panCandidate = null;
+this.PAN_THRESHOLD = 5; // pixels
+
+this.stage.on('mousedown', (e) => {
+  if (e.evt.button !== 0) return; // left only
+  // If the click is on a shape, let Konva's drag logic take over.
+  if (this._isOnShape(e.target)) return;
+
+  // Not on a shape: mark as a pan candidate but don't start yet.
+  const p = this.stage.getPointerPosition();
+  if (!p) return;
+  this.panCandidate = { x: p.x, y: p.y };
+  this.scrollStart = { left: this.mount.scrollLeft, top: this.mount.scrollTop };
+});
+
+this.stage.on('mousemove', () => {
+  const p = this.stage.getPointerPosition();
+  if (!p) return;
+
+  // If we're actively panning, apply deltas to scroll.
+  if (this.isPanning && this.panStart) {
+    const dx = p.x - this.panStart.x;
+    const dy = p.y - this.panStart.y;
+    this.suppressScrollSync = true;
+    this.mount.scrollLeft = this.scrollStart.left - dx;
+    this.mount.scrollTop  = this.scrollStart.top  - dy;
+    this.pinOverlayToScroll();
+    this.suppressScrollSync = false;
+    return;
+  }
+
+  // If we only have a candidate, see if we've moved far enough to start a pan.
+  if (this.panCandidate) {
+    const dx = p.x - this.panCandidate.x;
+    const dy = p.y - this.panCandidate.y;
+    if ((dx*dx + dy*dy) >= (this.PAN_THRESHOLD * this.PAN_THRESHOLD)) {
+      // Promote to real pan
+      this.isPanning = true;
+      this.panStart = { x: this.panCandidate.x, y: this.panCandidate.y };
+      this.stage.container().style.cursor = 'grabbing';
+      this.mount.style.userSelect = 'none';
+      // keep existing scrollStart
+    }
+  }
+});
+
+const cancelPanGesture = () => {
+  this.isPanning = false;
+  this.panStart = null;
+  this.panCandidate = null;
+  this.scrollStart = null;
+  this.stage.container().style.cursor = '';
+  this.mount.style.userSelect = '';
+};
+
+this.stage.on('mouseup', cancelPanGesture);
+this.stage.on('mouseleave', cancelPanGesture);
+
+// If a drag actually starts (e.g., you grabbed a card), cancel any pan-in-progress/candidate.
+this.stage.on('dragstart', () => { cancelPanGesture(); });
 
     // resize + initial center
     new ResizeObserver(() => this._resizeStageToViewport()).observe(this.mount);
