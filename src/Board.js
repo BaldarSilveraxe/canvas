@@ -26,8 +26,8 @@ export class Board {
     this.worldStyle = { top: '#0f1418', bottom: '#0b0f13', stroke: '#2a3238' };
     this.gridStyle  = { spacing: 100, heavyEvery: 500, light: '#1c242a', heavy: '#2f3a41' };
 
-    // Global card shadow state (native Konva shadow on card body)
-    this.cardShadow = { enabled: true, dx: 6, dy: 6, color: '#000000', opacity: 0.35, blur: 12 };
+    // global card shadow style (native Konva shadows on body)
+    this.cardShadow = { enabled: true, dx: 6, dy: 6, blur: 6, color: '#000000', opacity: 0.35 };
 
     // DOM
     this.mount = mount;
@@ -52,54 +52,49 @@ export class Board {
         `translate(${this.mount.scrollLeft}px, ${this.mount.scrollTop}px)`;
     };
 
-    // Konva stage
+    // Konva: single Layer + world group (so camera transform applies to all)
     this.stage = new Konva.Stage({
       container: this.stageHost,
       width: this.stageHost.clientWidth,
       height: this.stageHost.clientHeight
     });
+    this.layer = new Konva.Layer();
+    this.world = new Konva.Group({ x: 0, y: 0, scaleX: 1, scaleY: 1 });
+    this.layer.add(this.world);
+    this.stage.add(this.layer);
 
-    // ------- LAYERS (lowest → highest) -------
-    this.layers = {
-      background:   new Konva.Layer({ listening: false }),
-      grid:         new Konva.Layer({ listening: false }),
-      stringsBelow: new Konva.Layer({ listening: false }),
-      cards:        new Konva.Layer(),
-      stringsAbove: new Konva.Layer({ listening: false }),
-      pins:         new Konva.Layer({ listening: false })
+    // Subgroups inside "world" for z-bucketing
+    this.groups = {
+      background:   new Konva.Group({ name: 'g-background' }),
+      grid:         new Konva.Group({ name: 'g-grid' }),
+      stringsBelow: new Konva.Group({ name: 'g-strings-below' }),
+      cards:        new Konva.Group({ name: 'g-cards' }),
+      stringsAbove: new Konva.Group({ name: 'g-strings-above' }),
+      pins:         new Konva.Group({ name: 'g-pins' })
     };
-    Object.values(this.layers).forEach(l => this.stage.add(l));
+    // Order matters
+    this.world.add(
+      this.groups.background,
+      this.groups.grid,
+      this.groups.stringsBelow,
+      this.groups.cards,
+      this.groups.stringsAbove,
+      this.groups.pins
+    );
 
-    // Each layer gets a "world group" that we transform for camera/pan/zoom
-    this.worldGroups = {
-      background:   new Konva.Group(),
-      grid:         new Konva.Group(),
-      stringsBelow: new Konva.Group(),
-      cards:        new Konva.Group(),
-      stringsAbove: new Konva.Group(),
-      pins:         new Konva.Group()
-    };
-    this.layers.background.add(this.worldGroups.background);
-    this.layers.grid.add(this.worldGroups.grid);
-    this.layers.stringsBelow.add(this.worldGroups.stringsBelow);
-    this.layers.cards.add(this.worldGroups.cards);
-    this.layers.stringsAbove.add(this.worldGroups.stringsAbove);
-    this.layers.pins.add(this.worldGroups.pins);
-
-    // World visuals (BG + grid + markers)
+    // world visuals
     this._buildWorld();
 
-    // Shapes
+    // models + nodes
     this.SHAPES = new Map();      // id -> model
-    this.SHAPE_NODES = new Map(); // id -> Konva.Group (in cards worldGroup)
-    this.READ_ONLY = false;
+    this.SHAPE_NODES = new Map(); // id -> Konva.Group
 
     // hooks
     this.Hooks = {
-      onSelect:   () => {},
-      onDragStart:(id, pos) => true,
-      onDrag:     (id, pos) => {},
-      onDragEnd:  (id, pos) => {}
+      onDragStart: ()=>true,
+      onDrag: ()=>{},
+      onDragEnd: ()=>{},
+      onZOrderChange: ()=>{}
     };
 
     // camera
@@ -137,8 +132,8 @@ export class Board {
     // left-click pan when not on a shape
     this.isPanning = false; this.panStart = null; this.scrollStart = null;
     this.stage.on('mousedown', (e) => {
-      if (e.evt.button !== 0) return;         // only left button
-      if (this._isOnShape(e.target)) return;  // let shapes drag themselves
+      if (e.evt.button !== 0) return;         // only left
+      if (this._isOnShape(e.target)) return;  // let shapes drag
       this._startPanAtPointer();
     });
     this.stage.on('dragstart', () => { if (this.isPanning) this._endPan(); });
@@ -155,7 +150,6 @@ export class Board {
       this.mount.scrollTop  = this.scrollStart.top  - dy;
       this.pinOverlayToScroll();
       this.suppressScrollSync = false;
-      // scroll handler updates camera & render
     });
 
     // resize + initial center
@@ -167,25 +161,27 @@ export class Board {
   }
 
   // ---------- PUBLIC API ----------
-  applySnapshot(arr) {
-    const incoming = new Set(arr.map(s => s.id));
-    arr.forEach(s => this._upsertShape(s));
-    this.SHAPE_NODES.forEach((_, id) => { if (!incoming.has(id)) this._removeShape(id); });
-    this.layers.cards.batchDraw();
-  }
-  applyPatch(patch) {
-    if (!patch) return;
-    if (Array.isArray(patch.add))    patch.add.forEach(s => this._upsertShape(s));
-    if (Array.isArray(patch.update)) patch.update.forEach(s => this._upsertShape(s));
-    if (Array.isArray(patch.remove)) patch.remove.forEach(id => this._removeShape(id));
-    this.layers.cards.batchDraw();
-  }
-  setReadOnly(flag) {
-    this.READ_ONLY = !!flag;
-    this.SHAPE_NODES.forEach(node => node.draggable(!this.READ_ONLY));
-  }
   setCallbacks(cb) { Object.assign(this.Hooks, cb || {}); }
 
+  applySnapshot(arr) {
+    // Sort by z (undefined -> 0) so we create back->front
+    const sorted = [...arr].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
+    const incoming = new Set(sorted.map(s => s.id));
+    sorted.forEach(s => this._upsertCard(s));   // (cards only in this phase)
+    // remove missing
+    this.SHAPE_NODES.forEach((_, id) => { if (!incoming.has(id)) this._removeShape(id); });
+    this.layer.batchDraw();
+  }
+
+  applyPatch(patch) {
+    if (!patch) return;
+    if (Array.isArray(patch.add))    patch.add.forEach(s => this._upsertCard(s));
+    if (Array.isArray(patch.update)) patch.update.forEach(s => this._upsertCard(s));
+    if (Array.isArray(patch.remove)) patch.remove.forEach(id => this._removeShape(id));
+    this.layer.batchDraw();
+  }
+
+  // Camera helpers
   center() { this._animatePanTo(this.CFG.world.width/2, this.CFG.world.height/2); }
   setZoomPct(pct){
     const c={x:this.stage.width()/2,y:this.stage.height()/2};
@@ -203,36 +199,25 @@ export class Board {
     return { x: rect.left + (worldX - this.camera.x)*this.zoom, y: rect.top + (worldY - this.camera.y)*this.zoom };
   }
 
-  /** Selection helper used by right panel */
-  getShapeState(id) {
-    const m = this.SHAPES.get(id);
-    return m ? { id: m.id, cx: m.cx, cy: m.cy, w: m.w, h: m.h, rot: m.rot || 0 } : null;
-  }
-
-  /** GLOBAL: Show/hide the grid */
+  // Global world/grid/shadow styling
   setGridVisible(flag) {
-    if (!this.layers?.grid) return;
-    this.layers.grid.visible(!!flag);
-    this.layers.grid.batchDraw();
+    if (!this.groups?.grid) return;
+    this.groups.grid.visible(!!flag);
+    this.layer.batchDraw();
   }
   isGridVisible() {
-    return !!this.layers?.grid?.visible();
+    return !!this.groups?.grid?.visible();
   }
-
-  /** GLOBAL: world gradient / border */
   setWorldStyle({ top, bottom, stroke } = {}) {
     if (top    != null) this.worldStyle.top    = top;
     if (bottom != null) this.worldStyle.bottom = bottom;
     if (stroke != null) this.worldStyle.stroke = stroke;
-
     if (this.worldBG) {
       this.worldBG.fillLinearGradientColorStops([0, this.worldStyle.top, 1, this.worldStyle.bottom]);
       this.worldBG.stroke(this.worldStyle.stroke);
-      this.layers.background.batchDraw();
+      this.layer.draw();
     }
   }
-
-  /** GLOBAL: grid spacing/colors */
   setGridStyle({ spacing, heavyEvery, light, heavy } = {}) {
     if (spacing    != null) this.gridStyle.spacing    = Math.max(10, +spacing || 10);
     if (heavyEvery != null) this.gridStyle.heavyEvery = Math.max(50, +heavyEvery || 50);
@@ -246,39 +231,58 @@ export class Board {
         lightColor:  this.gridStyle.light,
         heavyColor:  this.gridStyle.heavy
       });
-      this.layers.grid.batchDraw();
+      this.layer.draw();
     }
   }
-
-  /** GLOBAL: card native shadow for all cards */
-  setCardShadowStyle({ enabled, dx, dy, color, opacity, blur } = {}) {
+  setCardShadowStyle({ enabled, dx, dy, blur, color, opacity } = {}) {
     if (enabled != null) this.cardShadow.enabled = !!enabled;
-    if (dx != null) this.cardShadow.dx = +dx || 0;
-    if (dy != null) this.cardShadow.dy = +dy || 0;
-    if (color != null) this.cardShadow.color = color;
-    if (opacity != null) this.cardShadow.opacity = +opacity || 0;
-    if (blur != null) this.cardShadow.blur = +blur || 0;
+    if (dx      != null) this.cardShadow.dx = +dx || 0;
+    if (dy      != null) this.cardShadow.dy = +dy || 0;
+    if (blur    != null) this.cardShadow.blur = +blur || 0;
+    if (color   != null) this.cardShadow.color = color;
+    if (opacity != null) this.cardShadow.opacity = Math.max(0, Math.min(1, +opacity));
 
-    // apply to all card bodies
-    this.SHAPE_NODES.forEach((node, id) => {
-      const kind = node.getAttr('shapeKind');
-      if (kind !== 'card') return;
-      const body = node.findOne('.body');
+    // Apply to existing card bodies
+    this.groups.cards.getChildren().forEach(g => {
+      const body = g.findOne('.body');
       if (!body) return;
       if (this.cardShadow.enabled) {
         body.shadowColor(this.cardShadow.color);
-        body.shadowOpacity(this.cardShadow.opacity);
         body.shadowBlur(this.cardShadow.blur);
+        body.shadowOpacity(this.cardShadow.opacity);
         body.shadowOffset({ x: this.cardShadow.dx, y: this.cardShadow.dy });
       } else {
-        body.shadowColor('rgba(0,0,0,0)');
-        body.shadowOpacity(0);
         body.shadowBlur(0);
+        body.shadowOpacity(0);
         body.shadowOffset({ x: 0, y: 0 });
       }
     });
-    this.layers.cards.batchDraw();
+    this.layer.batchDraw();
   }
+
+  // Z-Order helpers
+  getCardOrder() {
+    const nodes = this.groups.cards.getChildren(n => n.hasName('shape') && n.getAttr('shapeKind') === 'card');
+    return nodes.map((n, idx) => ({ id: n.getAttr('shapeId'), z: idx }));
+  }
+
+  _normalizeAndEmitCardOrder() {
+    const order = this.getCardOrder(); // dense, back->front
+    // update in-memory models
+    order.forEach(({id, z}) => {
+      const m = this.SHAPES.get(id);
+      if (m) m.z = z;
+    });
+    // emit hook for persistence
+    this.Hooks.onZOrderChange?.(order);
+  }
+
+  getCards() {
+    // return models in draw order (using groups.cards children)
+    const nodes = this.groups.cards.getChildren(n => n.hasName('shape') && n.getAttr('shapeKind') === 'card');
+    return nodes.map(n => this.SHAPES.get(n.getAttr('shapeId'))).filter(Boolean);
+  }
+  getShapeModel(id) { return this.SHAPES.get(id); }
 
   // ---------- INTERNALS ----------
   _buildWorld() {
@@ -292,9 +296,9 @@ export class Board {
       fillLinearGradientColorStops: [0, this.worldStyle.top, 1, this.worldStyle.bottom],
       stroke: this.worldStyle.stroke, strokeWidth: 2
     });
-    this.worldGroups.background.add(this.worldBG);
+    this.groups.background.add(this.worldBG);
 
-    // grid
+    // grid (draw across full world)
     const gridW = W, gridH = H;
     this.gridShape = new Konva.Shape({
       listening: false,
@@ -307,201 +311,211 @@ export class Board {
         const heavyEach = shape.getAttr('heavyEvery');
         const lightCol  = shape.getAttr('lightColor');
         const heavyCol  = shape.getAttr('heavyColor');
-
-        // light lines
+        // light
         ctx.beginPath(); ctx.strokeStyle = lightCol; ctx.lineWidth = 1;
         for (let x = 0; x <= gridW; x += spacing)
           if (x % heavyEach !== 0) { ctx.moveTo(x + 0.5, 0.5); ctx.lineTo(x + 0.5, gridH + 0.5); }
         for (let y = 0; y <= gridH; y += spacing)
           if (y % heavyEach !== 0) { ctx.moveTo(0.5, y + 0.5); ctx.lineTo(gridW + 0.5, y + 0.5); }
         ctx.stroke();
-
-        // heavy lines
+        // heavy
         ctx.beginPath(); ctx.strokeStyle = heavyCol; ctx.lineWidth = 2;
         for (let x = 0; x <= gridW; x += heavyEach) { ctx.moveTo(x + 0.5, 0.5); ctx.lineTo(x + 0.5, gridH + 0.5); }
         for (let y = 0; y <= gridH; y += heavyEach) { ctx.moveTo(0.5, y + 0.5); ctx.lineTo(gridW + 0.5, y + 0.5); }
         ctx.stroke();
       }
     });
-    this.worldGroups.grid.add(this.gridShape);
+    this.groups.grid.add(this.gridShape);
 
-    // markers (on background layer so they sit under grid)
-    const addDot = (x,y)=>this.worldGroups.background.add(new Konva.Circle({ x,y, radius:3, fill:'#9AE6B4' }));
-    const addLbl = (x,y,t)=>this.worldGroups.background.add(new Konva.Text({ x,y, text:t, fill:'#9AE6B4', fontSize:12, fontFamily:'ui-monospace, monospace' }));
+    // corner markers
+    const addDot = (x,y)=>this.groups.background.add(new Konva.Circle({ x,y, radius:3, fill:'#9AE6B4' }));
+    const addLbl = (x,y,t)=>this.groups.background.add(new Konva.Text({ x,y, text:t, fill:'#9AE6B4', fontSize:12, fontFamily:'ui-monospace, monospace' }));
     addDot(0,0);       addLbl(8,4,'0,0');
     addDot(0,H);       addLbl(8,H-16,`0,${H}`);
     addDot(W,0);       addLbl(W-88,4,`${W},0`);
     addDot(W,H);       addLbl(W-128,H-16,`${W},${H}`);
     const cx=W/2, cy=H/2; addDot(cx,cy); addLbl(cx+8,cy+4,`${cx},${cy}`);
 
-    this.stage.draw();
+    this.layer.draw();
   }
 
-  _clampShapeCenter(cx, cy, w, h) {
+  _clampCardCenter(cx, cy, w, h) {
     const halfW = w/2, halfH = h/2;
     const minX = halfW, maxX = this.CFG.world.width  - halfW;
     const minY = halfH, maxY = this.CFG.world.height - halfH;
     return { cx: Math.min(Math.max(minX, cx), maxX), cy: Math.min(Math.max(minY, cy), maxY) };
   }
 
-  _applyCardBodyShadow(body) {
+  _applyShadowToBody(body) {
     if (!body) return;
     if (this.cardShadow.enabled) {
       body.shadowColor(this.cardShadow.color);
-      body.shadowOpacity(this.cardShadow.opacity);
       body.shadowBlur(this.cardShadow.blur);
+      body.shadowOpacity(this.cardShadow.opacity);
       body.shadowOffset({ x: this.cardShadow.dx, y: this.cardShadow.dy });
     } else {
-      body.shadowColor('rgba(0,0,0,0)');
-      body.shadowOpacity(0);
       body.shadowBlur(0);
+      body.shadowOpacity(0);
       body.shadowOffset({ x: 0, y: 0 });
     }
   }
 
-  _upsertShape(model) {
+  _upsertCard(model) {
     const prev = this.SHAPES.get(model.id);
     const next = { kind: 'card', ...prev, ...model };
-    next.w = typeof next.w === 'number' ? next.w : 200;
-    next.h = typeof next.h === 'number' ? next.h : 120;
-    const clamped = this._clampShapeCenter(next.cx ?? (prev?.cx ?? next.w/2),
-                                           next.cy ?? (prev?.cy ?? next.h/2),
-                                           next.w, next.h);
+    next.w = typeof next.w === 'number' ? next.w : 300;
+    next.h = typeof next.h === 'number' ? next.h : 150;
+
+    const clamped = this._clampCardCenter(
+      next.cx ?? (prev?.cx ?? next.w/2),
+      next.cy ?? (prev?.cy ?? next.h/2),
+      next.w, next.h
+    );
     next.cx = clamped.cx; next.cy = clamped.cy;
+
+    // Default z to previous or append to end
+    if (typeof next.z !== 'number') {
+      next.z = (typeof prev?.z === 'number') ? prev.z : this.groups.cards.getChildren().length;
+    }
+
     this.SHAPES.set(next.id, next);
 
     let node = this.SHAPE_NODES.get(next.id);
-
-    // corner style
-    const cr = (() => {
-      switch (next.styleKey) {
-        case 'sharp':          return 0;
-        case 'bottomRounded':  return [0,0,10,10];
-        default:               return 10; // standard rounded
-      }
-    })();
-
     if (!node) {
       node = new Konva.Group({
         x: next.cx, y: next.cy,
         offsetX: next.w/2, offsetY: next.h/2,
-        draggable: !this.READ_ONLY,
+        draggable: true,
         name: 'shape card'
       });
-      node.setAttr('shapeKind', next.kind);
+      node.setAttr('shapeId', next.id);
+      node.setAttr('shapeKind', 'card');
 
-      // card rect
+      // BODY + header + text + image
       const body = new Konva.Rect({
         name: 'body',
         x: 0, y: 0, width: next.w, height: next.h,
-        cornerRadius: cr,
-        fill: next.bodyFill ?? '#0e161d',
-        stroke: next.stroke || next.style?.stroke || '#93c5fd',
-        strokeWidth: next.strokeWidth ?? next.style?.strokeWidth ?? 2
+        cornerRadius: this._cornerRadiusForStyle(next.styleKey, next.w, next.h),
+        fillLinearGradientStartPoint: { x: 0, y: 0 },
+        fillLinearGradientEndPoint:   { x: 0, y: next.h },
+        fillLinearGradientColorStops: [0, next.bodyFill ?? '#1b2126', 1, '#11161a'],
+        stroke: next.stroke ?? '#3b4a52',
+        strokeWidth: next.strokeWidth ?? 2
       });
-      this._applyCardBodyShadow(body);
+      this._applyShadowToBody(body);
 
-      // header
       const headerH = 26;
       const header = new Konva.Rect({
         name: 'header',
         x: 0, y: 0, width: next.w, height: headerH,
-        cornerRadius: Array.isArray(cr) ? [cr[0], cr[1], 0, 0] : (cr ? [cr,cr,0,0] : 0),
-        fill: next.headerFill ?? '#0b1217'
+        cornerRadius: this._headerCornerRadiusForStyle(next.styleKey, next.w, headerH),
+        fill: next.headerFill ?? '#0f1317'
       });
 
-      // title
-      const titleText = new Konva.Text({
-        name: 'label',
-        x: 8, y: 5, width: next.w - 16, height: headerH - 10,
+      const title = new Konva.Text({
+        name: 'title',
         text: next.title ?? next.id,
-        fontSize: 13, fill: '#cfe3d0', fontFamily: 'ui-monospace, monospace', listening: false
+        x: 12, y: 5, width: next.w - 24, height: headerH - 8,
+        fontFamily: 'ui-monospace, monospace', fontSize: 14, fill: '#cfe3d0', listening: false
       });
 
-      // image (70x70) at left, inside body under header
-      let imgNode = null;
-      if (next.img) {
-        imgNode = new Konva.Image({ x: 10, y: headerH + 10, width: 70, height: 70, listening: false });
-        const image = new Image();
-        image.onload = () => { imgNode.image(image); this.layers.cards.batchDraw(); };
-        image.src = next.img;
-      }
-
-      // click to select
-      node.on('mousedown', () => {
-        const s = this.getShapeState(next.id);
-        this.Hooks.onSelect(next.id, s);
+      const imgSize = 70;
+      const imgRect = new Konva.Rect({
+        name: 'imgFrame',
+        x: 12, y: headerH + 10, width: imgSize, height: imgSize,
+        cornerRadius: 6, stroke: '#2d3741', strokeWidth: 1, fill: '#0d1115'
       });
 
-      // cursor affordance
-      node.on('mouseenter', () => this.stage.container().style.cursor = this.READ_ONLY ? '' : 'grab');
-      node.on('mousedown',  () => this.stage.container().style.cursor = this.READ_ONLY ? '' : 'grabbing');
-      node.on('mouseup',    () => this.stage.container().style.cursor = this.READ_ONLY ? '' : 'grab');
+      node.add(body, header, title, imgRect);
+
+      if (typeof next.rot === 'number') node.rotation(next.rot);
+
+      // Drag UX
+      node.on('mouseenter', () => this.stage.container().style.cursor = 'grab');
+      node.on('mousedown',  () => this.stage.container().style.cursor = 'grabbing');
+      node.on('mouseup',    () => this.stage.container().style.cursor = 'grab');
       node.on('mouseleave', () => this.stage.container().style.cursor = '');
 
       node.dragBoundFunc((pos) => {
-        const p = this._clampShapeCenter(pos.x, pos.y, next.w, next.h);
+        const p = this._clampCardCenter(pos.x, pos.y, next.w, next.h);
         return { x: p.cx, y: p.cy };
       });
+
       node.on('dragstart', () => {
-        if (this.READ_ONLY) { node.stopDrag(); return; }
+        // bring to front immediately
+        node.moveToTop();
+        this.layer.batchDraw();
         const ok = this.Hooks.onDragStart(next.id, { cx: next.cx, cy: next.cy });
         if (ok === false) { node.stopDrag(); return; }
       });
+
       node.on('dragmove', () => {
-        const p = this._clampShapeCenter(node.x(), node.y(), next.w, next.h);
+        const p = this._clampCardCenter(node.x(), node.y(), next.w, next.h);
         node.position({ x: p.cx, y: p.cy });
         next.cx = p.cx; next.cy = p.cy;
         this.Hooks.onDrag(next.id, { cx: next.cx, cy: next.cy });
       });
+
       node.on('dragend', () => {
-        const p = this._clampShapeCenter(node.x(), node.y(), next.w, next.h);
+        const p = this._clampCardCenter(node.x(), node.y(), next.w, next.h);
         node.position({ x: p.cx, y: p.cy });
         next.cx = p.cx; next.cy = p.cy;
         this.Hooks.onDragEnd(next.id, { cx: next.cx, cy: next.cy });
+        // Normalize and emit order for persistence
+        this._normalizeAndEmitCardOrder();
       });
 
-      // assemble
-      node.add(body, header, titleText);
-      if (imgNode) node.add(imgNode);
-
-      this.worldGroups.cards.add(node);
+      this.groups.cards.add(node);
       this.SHAPE_NODES.set(next.id, node);
+
+      // Respect incoming z (place at index). We can use zIndex or reorder:
+      if (typeof next.z === 'number') node.zIndex(next.z);
+
     } else {
+      // update existing
       node.position({ x: next.cx, y: next.cy });
       if (typeof next.rot === 'number') node.rotation(next.rot);
-      node.setAttr('shapeKind', next.kind);
 
       const body   = node.findOne('.body');
       const header = node.findOne('.header');
-      const label  = node.findOne('.label');
-
-      // corner radius update
-      if (body) body.cornerRadius(cr);
-      if (header) header.cornerRadius(Array.isArray(cr) ? [cr[0], cr[1], 0, 0] : (cr ? [cr,cr,0,0] : 0));
+      const title  = node.findOne('.title');
 
       const sizesChanged = (body?.width() !== next.w) || (body?.height() !== next.h);
       if (sizesChanged) {
-        if (body)   { body.width(next.w); body.height(next.h); }
-        if (header) { header.width(next.w); }
-        if (label)  { label.width(next.w - 16); }
+        body?.width(next.w); body?.height(next.h);
+        body?.cornerRadius(this._cornerRadiusForStyle(next.styleKey, next.w, next.h));
+        header?.width(next.w);
+        header?.cornerRadius(this._headerCornerRadiusForStyle(next.styleKey, next.w, 26));
+        title?.width(next.w - 24);
         node.offset({ x: next.w/2, y: next.h/2 });
-        const p = this._clampShapeCenter(node.x(), node.y(), next.w, next.h);
+
+        const p = this._clampCardCenter(node.x(), node.y(), next.w, next.h);
         node.position({ x: p.cx, y: p.cy });
         next.cx = p.cx; next.cy = p.cy;
       }
-      if (body) {
-        body.fill(next.bodyFill ?? '#0e161d');
-        body.stroke(next.stroke || next.style?.stroke || '#93c5fd');
-        const sw = (next.strokeWidth != null) ? next.strokeWidth : next.style?.strokeWidth;
-        if (sw != null) body.strokeWidth(sw);
-        this._applyCardBodyShadow(body);
-      }
-      if (header) header.fill(next.headerFill ?? '#0b1217');
-      node.draggable(!this.READ_ONLY);
-    }
 
-    this.layers.cards.batchDraw();
+      if (body) {
+        if (next.stroke) body.stroke(next.stroke);
+        if (next.strokeWidth != null) body.strokeWidth(next.strokeWidth);
+        this._applyShadowToBody(body);
+      }
+
+      if (title && next.title != null) title.text(next.title);
+
+      // z update if requested
+      if (typeof next.z === 'number') node.zIndex(next.z);
+    }
+  }
+
+  _cornerRadiusForStyle(styleKey, w, h) {
+    if (styleKey === 'sharp') return 0;
+    if (styleKey === 'bottomRounded') return [0,0,10,10];
+    return 10; // standard
+  }
+  _headerCornerRadiusForStyle(styleKey, w, h) {
+    if (styleKey === 'sharp') return 0;
+    if (styleKey === 'bottomRounded') return [0,0,0,0];
+    return [10,10,0,0];
   }
 
   _removeShape(id) {
@@ -510,7 +524,7 @@ export class Board {
     if (node) { node.destroy(); this.SHAPE_NODES.delete(id); }
   }
 
-  // camera helpers
+  // camera + UI
   _getFitMinZoom() {
     const vw = this.mount.clientWidth  || 1;
     const vh = this.mount.clientHeight || 1;
@@ -528,15 +542,9 @@ export class Board {
     this.camera.y = Math.min(Math.max(0, this.camera.y), maxY);
   }
   _render() {
-    // Apply camera transform to all world groups (so all layers move together)
-    const tx = -this.camera.x * this.zoom;
-    const ty = -this.camera.y * this.zoom;
-    for (const g of Object.values(this.worldGroups)) {
-      g.scale({ x: this.zoom, y: this.zoom });
-      g.position({ x: tx, y: ty });
-    }
-    // draw all layers once
-    this.stage.batchDraw();
+    this.world.scale({ x: this.zoom, y: this.zoom });
+    this.world.position({ x: -this.camera.x * this.zoom, y: -this.camera.y * this.zoom });
+    this.layer.batchDraw();
   }
   _syncScrollFromCamera() {
     this.suppressScrollSync = true;
