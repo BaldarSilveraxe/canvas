@@ -15,6 +15,44 @@ const DEFAULT_CFG = {
   pan: { animMs: 220 }
 };
 
+// ---------- NEW: base metrics + scaler ----------
+const CARD_BASE = {
+  w: 300,     // design width
+  h: 150,     // design height
+  pad: 12,    // inner padding
+  headerH: 26,
+  img: 70,
+  font: 14,
+  radius: 8,
+  strokeWidth: 2,
+  shadow: { dx: 6, dy: 6, blur: 6, opacity: 0.35 }
+};
+
+function computeCardMetrics(w, h) {
+  const sx = Math.max(0.1, w / CARD_BASE.w);
+  const sy = Math.max(0.1, h / CARD_BASE.h);
+  const s  = Math.min(sx, sy);
+
+  const pad         = Math.max(6,  CARD_BASE.pad * s);
+  const headerH     = Math.max(18, CARD_BASE.headerH * sy); // header tracks vertical scale
+  const titleFont   = Math.max(10, CARD_BASE.font * s);
+  const imgSize     = Math.max(32, CARD_BASE.img * s);
+  const imgX        = pad;
+  const imgY        = headerH + Math.max(6, 10 * s);
+  const cornerR     = Math.max(4, CARD_BASE.radius * s);
+  const strokeWidth = Math.max(1, CARD_BASE.strokeWidth * s);
+
+  const shadow = {
+    dx: Math.round(CARD_BASE.shadow.dx * s),
+    dy: Math.round(CARD_BASE.shadow.dy * s),
+    blur: Math.max(1, Math.round(CARD_BASE.shadow.blur * s)),
+    opacity: CARD_BASE.shadow.opacity
+  };
+
+  return { sx, sy, s, pad, headerH, titleFont, imgSize, imgX, imgY, cornerR, strokeWidth, shadow };
+}
+// ------------------------------------------------
+
 const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
 
 export class Board {
@@ -265,16 +303,7 @@ export class Board {
     this.groups.cards.getChildren().forEach(g => {
       const body = g.findOne('.body');
       if (!body) return;
-      if (this.cardShadow.enabled) {
-        body.shadowColor(this.cardShadow.color);
-        body.shadowBlur(this.cardShadow.blur);
-        body.shadowOpacity(this.cardShadow.opacity);
-        body.shadowOffset({ x: this.cardShadow.dx, y: this.cardShadow.dy });
-      } else {
-        body.shadowBlur(0);
-        body.shadowOpacity(0);
-        body.shadowOffset({ x: 0, y: 0 });
-      }
+      this._applyShadowToBody(body); // uses current globals
     });
     this.layer.batchDraw();
   }
@@ -361,13 +390,14 @@ export class Board {
     return { cx: Math.min(Math.max(minX, cx), maxX), cy: Math.min(Math.max(minY, cy), maxY) };
   }
 
-  _applyShadowToBody(body) {
+  // ---------- CHANGED: shadow scales ----------
+  _applyShadowToBody(body, shadowScale = { dx: this.cardShadow.dx, dy: this.cardShadow.dy, blur: this.cardShadow.blur, opacity: this.cardShadow.opacity }) {
     if (!body) return;
     if (this.cardShadow.enabled) {
       body.shadowColor(this.cardShadow.color);
-      body.shadowBlur(this.cardShadow.blur);
-      body.shadowOpacity(this.cardShadow.opacity);
-      body.shadowOffset({ x: this.cardShadow.dx, y: this.cardShadow.dy });
+      body.shadowBlur(shadowScale.blur);
+      body.shadowOpacity(shadowScale.opacity);
+      body.shadowOffset({ x: shadowScale.dx, y: shadowScale.dy });
     } else {
       body.shadowBlur(0);
       body.shadowOpacity(0);
@@ -375,15 +405,17 @@ export class Board {
     }
   }
 
-  // build/replace the styled body+header via cardStyles.js
+  // ---------- CHANGED: build skin with scaled metrics ----------
   _buildCardSkin(node, model) {
+    const M = computeCardMetrics(model.w, model.h);
+
     const styleFn = cardStyles[model.styleKey] || cardStyles.default;
 
     const safeStyle = {
       w: model.w,
       h: model.h,
       stroke: model.stroke ?? '#3b4a52',
-      strokeWidth: model.strokeWidth ?? 2,
+      strokeWidth: model.strokeWidth ?? M.strokeWidth, // scale stroke
       bodyFill: model.bodyFill ?? '#1b2126',
       headerFill: model.headerFill ?? '#0f1317',
     };
@@ -391,9 +423,15 @@ export class Board {
     const skin = styleFn(safeStyle); // Group with .body + .header
     skin.name('cardGroup');
 
-    // apply shadow on body
-    const body = skin.findOne('.body'); // Remove if Scale Patch works 
-    if (body) this._applyShadowToBody(body);
+    // apply (scaled) shadow on body
+    const body = skin.findOne('.body');
+    this._applyShadowToBody(body, M.shadow);
+
+    // (Optionally) scale header block height if present
+    const headerNode = skin.findOne('.header');
+    if (headerNode && typeof headerNode.height === 'function') {
+      headerNode.height(M.headerH);
+    }
 
     node.add(skin);
 
@@ -402,11 +440,13 @@ export class Board {
     let img   = node.findOne('.img');
     let frame = node.findOne('.imgFrame');
 
-    const header = skin.findOne('.header');// Remove if Scale Patch works 
-    const headerH = header?.height() ?? 26;
-    const imgSize = 70;
-    const imgX = 12;
-    const imgY = headerH + 10;
+    // header height used for layout of title/img
+    const headerH = headerNode?.height?.() ?? M.headerH;
+
+    // ----- image slot (scaled) -----
+    const imgSize = M.imgSize;
+    const imgX = M.imgX;
+    const imgY = M.imgY;
 
     if (!img) {
       img = new Konva.Image({ name: 'img', x: imgX, y: imgY, width: imgSize, height: imgSize, listening: false, visible: false });
@@ -419,25 +459,37 @@ export class Board {
       frame = new Konva.Rect({
         name: 'imgFrame',
         x: imgX, y: imgY, width: imgSize, height: imgSize,
-        cornerRadius: 6, stroke: '#2d3741', strokeWidth: 1, fill: false
+        cornerRadius: M.cornerR, stroke: '#2d3741', strokeWidth: Math.max(1, Math.round(M.strokeWidth * 0.5)), fill: false
       });
       node.add(frame);
     } else {
-      frame.position({ x: imgX, y: imgY }); frame.size({ width: imgSize, height: imgSize }); frame.fillEnabled(false);
+      frame.position({ x: imgX, y: imgY }); frame.size({ width: imgSize, height: imgSize });
+      frame.cornerRadius(M.cornerR);
+      frame.strokeWidth(Math.max(1, Math.round(M.strokeWidth * 0.5)));
+      frame.fillEnabled(false);
     }
+
+    // ----- title (scaled) -----
+    const titleX = M.pad;
+    const titleY = Math.max(4, M.pad * 0.5);
+    const titleW = model.w - (M.pad * 2);
+    const titleH = Math.max(14, headerH - M.pad * 0.5);
 
     if (!title) {
       title = new Konva.Text({
         name: 'title',
-        x: 12, y: 6, width: model.w - 24, height: (headerH - 8),
+        x: titleX, y: titleY, width: titleW, height: titleH,
         text: model.title ?? model.id,
-        fontFamily: 'ui-monospace, monospace', fontSize: 14, fill: '#cfe3d0', listening: false,
+        fontFamily: 'ui-monospace, monospace', fontSize: M.titleFont, fill: '#cfe3d0', listening: false,
         align: 'left', verticalAlign: 'middle',
       });
       node.add(title);
     } else {
-      title.position({ x: 12, y: 6 }); title.width(model.w - 24); title.height(headerH - 8);
-      title.text(model.title ?? model.id);
+      title.position({ x: titleX, y: titleY });
+      title.width(titleW);
+      title.height(titleH);
+      title.fontSize(M.titleFont);
+      if (model.title != null) title.text(model.title);
     }
 
     // keep draw order: cardGroup (skin) -> img -> frame -> title
@@ -463,8 +515,8 @@ export class Board {
   _upsertCard(model) {
     const prev = this.SHAPES.get(model.id);
     const next = { kind: 'card', ...prev, ...model };
-    next.w = typeof next.w === 'number' ? next.w : 300;
-    next.h = typeof next.h === 'number' ? next.h : 150;
+    next.w = typeof next.w === 'number' ? next.w : CARD_BASE.w;
+    next.h = typeof next.h === 'number' ? next.h : CARD_BASE.h;
 
     const clamped = this._clampCardCenter(
       next.cx ?? (prev?.cx ?? next.w/2),
@@ -584,8 +636,8 @@ export class Board {
     node.on('transform.board', () => {
       const m = this.SHAPES.get(id);
       if (!m) return;
-      const w = Math.round((m.w ?? 300) * node.scaleX());
-      const h = Math.round((m.h ?? 150) * node.scaleY());
+      const w = Math.round((m.w ?? CARD_BASE.w) * node.scaleX());
+      const h = Math.round((m.h ?? CARD_BASE.h) * node.scaleY());
       const rot = Math.round(node.rotation());
       this.Hooks.onDrag?.(id, { cx: m.cx, cy: m.cy, w, h, rot });
     });
@@ -596,8 +648,8 @@ export class Board {
       const m = this.SHAPES.get(id);
       if (!m) return;
 
-      const newW = Math.max(80, (m.w ?? 300) * node.scaleX());
-      const newH = Math.max(60, (m.h ?? 150) * node.scaleY());
+      const newW = Math.max(80, (m.w ?? CARD_BASE.w) * node.scaleX());
+      const newH = Math.max(60, (m.h ?? CARD_BASE.h) * node.scaleY());
       const newRot = node.rotation();
 
       m.w = newW;
@@ -852,7 +904,7 @@ export class Board {
     }
   }
 
-  // image fitting/centering inside the 70x70 slot
+  // image fitting/centering inside the (scaled) frame
   _setCardImage(node, url) {
     const imgNode = node.findOne('.img');
     const frame   = node.findOne('.imgFrame');
