@@ -1,6 +1,13 @@
 // src/Board.js
 import Konva from 'https://esm.sh/konva@9';
-import { cardStyles } from './cardStyles.js';
+import {
+  CARD_BASE,
+  computeCardMetrics,
+  applyShadowToBody,
+  buildCardSkin,
+  rebuildCardSkin,
+  setCardImage
+} from './buildCardSkin.js';
 
 const DEFAULT_CFG = {
   world: { width: 6000, height: 6000 },
@@ -15,44 +22,7 @@ const DEFAULT_CFG = {
   pan: { animMs: 220 }
 };
 
-// ---------- Scaled UI metrics ----------
-const CARD_BASE = {
-  w: 300,     // design width
-  h: 150,     // design height
-  pad: 12,    // inner padding
-  headerH: 26,
-  img: 70,
-  font: 14,
-  radius: 8,
-  strokeWidth: 2,
-  shadow: { dx: 6, dy: 6, blur: 6, opacity: 0.35 }
-};
-
-function computeCardMetrics(w, h) {
-  const sx = Math.max(0.1, w / CARD_BASE.w);
-  const sy = Math.max(0.1, h / CARD_BASE.h);
-  const s  = Math.min(sx, sy);
-
-  const pad         = Math.max(6,  CARD_BASE.pad * s);
-  const headerH     = Math.max(18, CARD_BASE.headerH * sy); // header tracks vertical scale
-  const titleFont   = Math.max(10, CARD_BASE.font * s);
-  const imgSize     = Math.max(32, CARD_BASE.img * s);
-  const imgX        = pad;
-  const imgY        = headerH + Math.max(6, 10 * s);
-  const cornerR     = Math.max(4, CARD_BASE.radius * s);
-  const strokeWidth = Math.max(1, CARD_BASE.strokeWidth * s);
-
-  const shadow = {
-    dx: Math.round(CARD_BASE.shadow.dx * s),
-    dy: Math.round(CARD_BASE.shadow.dy * s),
-    blur: Math.max(1, Math.round(CARD_BASE.shadow.blur * s)),
-    opacity: CARD_BASE.shadow.opacity
-  };
-
-  return { sx, sy, s, pad, headerH, titleFont, imgSize, imgX, imgY, cornerR, strokeWidth, shadow };
-}
-
-// ---------- Shift-rotate snapping (15°) ----------
+// Shift-rotate snapping (15°)
 const SNAP_DEG = 15;
 const SNAP_LIST = Array.from({ length: 360 / SNAP_DEG }, (_, i) => i * SNAP_DEG);
 
@@ -64,14 +34,14 @@ export class Board {
 
     this.CFG = deepMerge(structuredClone(DEFAULT_CFG), config);
 
-    // global style state
+    // world + grid styles
     this.worldStyle = { top: '#0f1418', bottom: '#0b0f13', stroke: '#2a3238' };
     this.gridStyle  = { spacing: 100, heavyEvery: 500, light: '#1c242a', heavy: '#2f3a41' };
 
-    // global card shadow style (native Konva shadows on body)
+    // card shadow style (global; each card scales it from metrics)
     this.cardShadow = { enabled: true, dx: 6, dy: 6, blur: 6, color: '#000000', opacity: 0.35 };
 
-    // DOM
+    // DOM scaffolding
     this.mount = mount;
     this.mount.style.position = 'relative';
     this.mount.style.overflow = 'auto';
@@ -94,7 +64,7 @@ export class Board {
         `translate(${this.mount.scrollLeft}px, ${this.mount.scrollTop}px)`;
     };
 
-    // Konva: one Layer + world group (camera transform applies to all)
+    // Stage/Layer/World
     this.stage = new Konva.Stage({
       container: this.stageHost,
       width: this.stageHost.clientWidth,
@@ -105,7 +75,7 @@ export class Board {
     this.layer.add(this.world);
     this.stage.add(this.layer);
 
-    // Subgroups inside "world" for z-bucketing
+    // z buckets
     this.groups = {
       background:   new Konva.Group({ name: 'g-background' }),
       grid:         new Konva.Group({ name: 'g-grid' }),
@@ -114,7 +84,6 @@ export class Board {
       stringsAbove: new Konva.Group({ name: 'g-strings-above' }),
       pins:         new Konva.Group({ name: 'g-pins' })
     };
-    // Order matters
     this.world.add(
       this.groups.background,
       this.groups.grid,
@@ -124,7 +93,7 @@ export class Board {
       this.groups.pins
     );
 
-    // Single transformer added to the same transformed "world"
+    // Transformer with rot snap (Shift)
     this.tr = new Konva.Transformer({
       rotateEnabled: true,
       boundBoxFunc: (oldBox, newBox) => {
@@ -132,12 +101,12 @@ export class Board {
         if (newBox.width < minW || newBox.height < minH) return oldBox;
         return newBox;
       },
-      rotationSnaps: [] // will toggle on Shift
+      rotationSnaps: []
     });
     this.world.add(this.tr);
     this.tr.moveToTop();
 
-    // --- Shift-key snap setup ---
+    // Shift-key toggling of rotation snaps
     this._shiftDown = false;
     this._applyRotationSnapMode = () => {
       if (!this.tr) return;
@@ -187,7 +156,7 @@ export class Board {
 
     // controls
     this.controls = controls;
-    this._wireControls();
+    this._wireControls(); // <-- this now exists ✅
 
     // scroll sync
     this.mount.addEventListener('scroll', () => {
@@ -211,16 +180,14 @@ export class Board {
       this._animateZoomTo(this.zoom * factor, anchorWorld, ptr);
     });
 
-    // left-click pan when not on a shape/transformer
+    // pan
     this.isPanning = false; this.panStart = null; this.scrollStart = null;
     this.stage.on('mousedown', (e) => {
-      // don't pan if we're on a transformer handle
       const parent = e.target && e.target.getParent && e.target.getParent();
       const isTransformerHandle = !!(parent && parent.getClassName && parent.getClassName() === 'Transformer');
       if (isTransformerHandle) return;
-
-      if (e.evt.button !== 0) return;         // only left
-      if (this._isOnShape(e.target)) return;  // let shapes drag/transform
+      if (e.evt.button !== 0) return;
+      if (this._isOnShape(e.target)) return;
       this._startPanAtPointer();
     });
     this.stage.on('dragstart', () => { if (this.isPanning) this._endPan(); });
@@ -251,11 +218,9 @@ export class Board {
   setCallbacks(cb) { Object.assign(this.Hooks, cb || {}); }
 
   applySnapshot(arr) {
-    // Sort by z (undefined -> 0) so we create back->front
     const sorted = [...arr].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
     const incoming = new Set(sorted.map(s => s.id));
     sorted.forEach(s => this._upsertCard(s));
-    // remove missing
     this.SHAPE_NODES.forEach((_, id) => { if (!incoming.has(id)) this._removeShape(id); });
     this.layer.batchDraw();
   }
@@ -286,15 +251,14 @@ export class Board {
     return { x: rect.left + (worldX - this.camera.x)*this.zoom, y: rect.top + (worldY - this.camera.y)*this.zoom };
   }
 
-  // Global world/grid/shadow styling
+  // Styling APIs
   setGridVisible(flag) {
     if (!this.groups?.grid) return;
     this.groups.grid.visible(!!flag);
     this.layer.batchDraw();
   }
-  isGridVisible() {
-    return !!this.groups?.grid?.visible();
-  }
+  isGridVisible() { return !!this.groups?.grid?.visible(); }
+
   setWorldStyle({ top, bottom, stroke } = {}) {
     if (top    != null) this.worldStyle.top    = top;
     if (bottom != null) this.worldStyle.bottom = bottom;
@@ -305,6 +269,7 @@ export class Board {
       this.layer.draw();
     }
   }
+
   setGridStyle({ spacing, heavyEvery, light, heavy } = {}) {
     if (spacing    != null) this.gridStyle.spacing    = Math.max(10, +spacing || 10);
     if (heavyEvery != null) this.gridStyle.heavyEvery = Math.max(50, +heavyEvery || 50);
@@ -321,6 +286,7 @@ export class Board {
       this.layer.draw();
     }
   }
+
   setCardShadowStyle({ enabled, dx, dy, blur, color, opacity } = {}) {
     if (enabled != null) this.cardShadow.enabled = !!enabled;
     if (dx      != null) this.cardShadow.dx = +dx || 0;
@@ -329,11 +295,14 @@ export class Board {
     if (color   != null) this.cardShadow.color = color;
     if (opacity != null) this.cardShadow.opacity = Math.max(0, Math.min(1, +opacity));
 
-    // Apply to existing card bodies
+    // Re-apply to each card using its own metrics (scaled)
     this.groups.cards.getChildren().forEach(g => {
+      const id = g.getAttr('shapeId');
+      const m  = this.SHAPES.get(id);
       const body = g.findOne('.body');
-      if (!body) return;
-      this._applyShadowToBody(body); // uses current globals
+      if (!m || !body) return;
+      const M = computeCardMetrics(m.w, m.h);
+      applyShadowToBody(body, this.cardShadow, M.shadow);
     });
     this.layer.batchDraw();
   }
@@ -344,7 +313,7 @@ export class Board {
     return nodes.map((n, idx) => ({ id: n.getAttr('shapeId'), z: idx }));
   }
   _normalizeAndEmitCardOrder() {
-    const order = this.getCardOrder(); // dense, back->front
+    const order = this.getCardOrder();
     order.forEach(({id, z}) => {
       const m = this.SHAPES.get(id);
       if (m) m.z = z;
@@ -362,7 +331,6 @@ export class Board {
   _buildWorld() {
     const W = this.CFG.world.width, H = this.CFG.world.height;
 
-    // background rect
     this.worldBG = new Konva.Rect({
       x: 0, y: 0, width: W, height: H,
       fillLinearGradientStartPoint: { x: 0, y: 0 },
@@ -372,7 +340,6 @@ export class Board {
     });
     this.groups.background.add(this.worldBG);
 
-    // grid (draw across full world)
     const gridW = W, gridH = H;
     this.gridShape = new Konva.Shape({
       listening: false,
@@ -385,14 +352,12 @@ export class Board {
         const heavyEach = shape.getAttr('heavyEvery');
         const lightCol  = shape.getAttr('lightColor');
         const heavyCol  = shape.getAttr('heavyColor');
-        // light
         ctx.beginPath(); ctx.strokeStyle = lightCol; ctx.lineWidth = 1;
         for (let x = 0; x <= gridW; x += spacing)
           if (x % heavyEach !== 0) { ctx.moveTo(x + 0.5, 0.5); ctx.lineTo(x + 0.5, gridH + 0.5); }
         for (let y = 0; y <= gridH; y += spacing)
           if (y % heavyEach !== 0) { ctx.moveTo(0.5, y + 0.5); ctx.lineTo(gridW + 0.5, y + 0.5); }
         ctx.stroke();
-        // heavy
         ctx.beginPath(); ctx.strokeStyle = heavyCol; ctx.lineWidth = 2;
         for (let x = 0; x <= gridW; x += heavyEach) { ctx.moveTo(x + 0.5, 0.5); ctx.lineTo(x + 0.5, gridH + 0.5); }
         for (let y = 0; y <= gridH; y += heavyEach) { ctx.moveTo(0.5, y + 0.5); ctx.lineTo(gridW + 0.5, y + 0.5); }
@@ -401,7 +366,6 @@ export class Board {
     });
     this.groups.grid.add(this.gridShape);
 
-    // corner markers
     const addDot = (x,y)=>this.groups.background.add(new Konva.Circle({ x,y, radius:3, fill:'#9AE6B4' }));
     const addLbl = (x,y,t)=>this.groups.background.add(new Konva.Text({ x,y, text:t, fill:'#9AE6B4', fontSize:12, fontFamily:'ui-monospace, monospace' }));
     addDot(0,0);       addLbl(8,4,'0,0');
@@ -420,121 +384,6 @@ export class Board {
     return { cx: Math.min(Math.max(minX, cx), maxX), cy: Math.min(Math.max(minY, cy), maxY) };
   }
 
-  _applyShadowToBody(body, shadowScale = { dx: this.cardShadow.dx, dy: this.cardShadow.dy, blur: this.cardShadow.blur, opacity: this.cardShadow.opacity }) {
-    if (!body) return;
-    if (this.cardShadow.enabled) {
-      body.shadowColor(this.cardShadow.color);
-      body.shadowBlur(shadowScale.blur);
-      body.shadowOpacity(shadowScale.opacity);
-      body.shadowOffset({ x: shadowScale.dx, y: shadowScale.dy });
-    } else {
-      body.shadowBlur(0);
-      body.shadowOpacity(0);
-      body.shadowOffset({ x: 0, y: 0 });
-    }
-  }
-
-  // build/replace the styled body+header via cardStyles.js
-  _buildCardSkin(node, model) {
-    const M = computeCardMetrics(model.w, model.h);
-
-    const styleFn = cardStyles[model.styleKey] || cardStyles.default;
-
-    const safeStyle = {
-      w: model.w,
-      h: model.h,
-      stroke: model.stroke ?? '#3b4a52',
-      strokeWidth: model.strokeWidth ?? M.strokeWidth, // scale stroke
-      bodyFill: model.bodyFill ?? '#1b2126',
-      headerFill: model.headerFill ?? '#0f1317',
-    };
-
-    const skin = styleFn(safeStyle); // Group with .body + .header
-    skin.name('cardGroup');
-
-    // apply (scaled) shadow on body
-    const body = skin.findOne('.body');
-    this._applyShadowToBody(body, M.shadow);
-
-    // scale header height if present (style may override)
-    const headerNode = skin.findOne('.header');
-    if (headerNode?.height) headerNode.height(M.headerH);
-
-    node.add(skin);
-
-    // ensure title & image nodes exist (or create them)
-    let title = node.findOne('.title');
-    let img   = node.findOne('.img');
-    let frame = node.findOne('.imgFrame');
-
-    const headerH = headerNode?.height?.() ?? M.headerH;
-    const imgSize = M.imgSize;
-    const imgX = M.imgX;
-    const imgY = M.imgY;
-
-    if (!img) {
-      img = new Konva.Image({ name: 'img', x: imgX, y: imgY, width: imgSize, height: imgSize, listening: false, visible: false });
-      node.add(img);
-    } else {
-      img.position({ x: imgX, y: imgY }); img.size({ width: imgSize, height: imgSize });
-    }
-
-    if (!frame) {
-      frame = new Konva.Rect({
-        name: 'imgFrame',
-        x: imgX, y: imgY, width: imgSize, height: imgSize,
-        cornerRadius: M.cornerR, stroke: '#2d3741', strokeWidth: Math.max(1, Math.round(M.strokeWidth * 0.5)), fill: false
-      });
-      node.add(frame);
-    } else {
-      frame.position({ x: imgX, y: imgY }); frame.size({ width: imgSize, height: imgSize });
-      frame.cornerRadius(M.cornerR);
-      frame.strokeWidth(Math.max(1, Math.round(M.strokeWidth * 0.5)));
-      frame.fillEnabled(false);
-    }
-
-    const titleX = M.pad;
-    const titleY = Math.max(4, M.pad * 0.5);
-    const titleW = model.w - (M.pad * 2);
-    const titleH = Math.max(14, headerH - M.pad * 0.5);
-
-    if (!title) {
-      title = new Konva.Text({
-        name: 'title',
-        x: titleX, y: titleY, width: titleW, height: titleH,
-        text: model.title ?? model.id,
-        fontFamily: 'ui-monospace, monospace', fontSize: M.titleFont, fill: '#cfe3d0', listening: false,
-        align: 'left', verticalAlign: 'middle',
-      });
-      node.add(title);
-    } else {
-      title.position({ x: titleX, y: titleY });
-      title.width(titleW);
-      title.height(titleH);
-      title.fontSize(M.titleFont);
-      if (model.title != null) title.text(model.title);
-    }
-
-    // keep draw order: cardGroup (skin) -> img -> frame -> title
-    skin.moveToBottom();
-    img.moveToTop(); frame.moveToTop(); title.moveToTop();
-
-    // (re)load image if URL present
-    this._setCardImage(node, model.img);
-  }
-
-  _rebuildCardSkin(node, model) {
-    const old = node.findOne('.cardGroup');
-    if (old) old.destroy();
-    this._buildCardSkin(node, model);
-
-    // keep selection/transformer after rebuild if this node is selected
-    if (this.tr && this.selectedId === model.id) {
-      this.tr.nodes([node]);
-      this.tr.getLayer()?.batchDraw();
-    }
-  }
-
   _upsertCard(model) {
     const prev = this.SHAPES.get(model.id);
     const next = { kind: 'card', ...prev, ...model };
@@ -548,7 +397,6 @@ export class Board {
     );
     next.cx = clamped.cx; next.cy = clamped.cy;
 
-    // Default z to previous or append to end
     if (typeof next.z !== 'number') {
       next.z = (typeof prev?.z === 'number') ? prev.z : this.groups.cards.getChildren().length;
     }
@@ -566,12 +414,10 @@ export class Board {
       node.setAttr('shapeId', next.id);
       node.setAttr('shapeKind', 'card');
 
-      // Build the styled skin (body+header) + title + image via helpers
-      this._buildCardSkin(node, next);
+      buildCardSkin(node, next, this.cardShadow);
 
       if (typeof next.rot === 'number') node.rotation(next.rot);
 
-      // Drag UX
       node.on('mouseenter', () => this.stage.container().style.cursor = 'grab');
       node.on('mousedown',  () => this.stage.container().style.cursor = 'grabbing');
       node.on('mouseup',    () => this.stage.container().style.cursor = 'grab');
@@ -582,7 +428,6 @@ export class Board {
         return { x: p.cx, y: p.cy };
       });
 
-      // bring to top while dragging; update inspector
       node.on('dragstart', () => {
         node.moveToTop();
         this.layer.batchDraw();
@@ -603,24 +448,15 @@ export class Board {
         this._normalizeAndEmitCardOrder();
       });
 
-      // Select immediately on press; stop bubbling so stage doesn't pan/clear
-      node.on('mousedown touchstart', (e) => {
-        this.selectCard(next.id);
-        e.cancelBubble = true;
-      });
-      node.on('click tap', (e) => {
-        this.selectCard(next.id);
-        e.cancelBubble = true;
-      });
+      node.on('mousedown touchstart', (e) => { this.selectCard(next.id); e.cancelBubble = true; });
+      node.on('click tap', (e) => { this.selectCard(next.id); e.cancelBubble = true; });
 
       this.groups.cards.add(node);
       this.SHAPE_NODES.set(next.id, node);
 
-      // Respect incoming z (place at index)
       if (typeof next.z === 'number') node.zIndex(next.z);
 
     } else {
-      // update existing
       const sizeChanged = (next.w !== prev.w) || (next.h !== prev.h);
       const styleChanged = next.styleKey !== prev?.styleKey
         || next.stroke !== prev?.stroke
@@ -633,34 +469,32 @@ export class Board {
 
       if (sizeChanged || styleChanged) {
         node.offset({ x: next.w/2, y: next.h/2 });
-        this._rebuildCardSkin(node, next);
+        rebuildCardSkin(node, next, this.cardShadow);
       } else {
         const title = node.findOne('.title');
         if (title && next.title != null) title.text(next.title);
-        this._setCardImage(node, next.img);
+        setCardImage(node, next.img);
       }
 
       if (typeof next.z === 'number') node.zIndex(next.z);
     }
   }
 
-  // Public: select a card, attach transformer, stream inspector updates, commit on end
+  // Selection + transform
   selectCard(id) {
     const node = this.SHAPE_NODES.get(id);
     if (!node) return;
     this.selectedId = id;
 
-    // attach transformer
     this.tr.nodes([node]);
     this.tr.getLayer()?.batchDraw();
 
-    // live inspector values while resizing/rotating + manual snap fallback
     node.off('transform.board');
     node.on('transform.board', () => {
       const m = this.SHAPES.get(id);
       if (!m) return;
 
-      // Manual snap if rotating with Shift (fallback for environments where rotationSnaps might not apply)
+      // Manual snap on Shift if rotater active (fallback)
       const active = typeof this.tr.getActiveAnchor === 'function' ? this.tr.getActiveAnchor() : null;
       if (this._shiftDown && active === 'rotater') {
         const raw = node.rotation();
@@ -674,7 +508,6 @@ export class Board {
       this.Hooks.onDrag?.(id, { cx: m.cx, cy: m.cy, w, h, rot });
     });
 
-    // commit w/h/rot on transform end (avoid snap-back)
     node.off('transformend.board');
     node.on('transformend.board', () => {
       const m = this.SHAPES.get(id);
@@ -684,20 +517,17 @@ export class Board {
       const newH = Math.max(60, (m.h ?? CARD_BASE.h) * node.scaleY());
       let newRot = node.rotation();
 
-      // final snap if Shift still held at end
       if (this._shiftDown) {
         newRot = Math.round(newRot / SNAP_DEG) * SNAP_DEG;
         node.rotation(newRot);
       }
 
-      m.w = newW;
-      m.h = newH;
-      m.rot = newRot;
+      m.w = newW; m.h = newH; m.rot = newRot;
 
       node.scale({ x: 1, y: 1 });
       node.offset({ x: newW / 2, y: newH / 2 });
 
-      this._rebuildCardSkin(node, m);
+      rebuildCardSkin(node, m, this.cardShadow);
 
       this.tr.nodes([node]);
       this.tr.getLayer()?.batchDraw();
@@ -838,7 +668,7 @@ export class Board {
     this.isPanning = false;
     this.panStart = null;
     this.scrollStart = null;
-       this.stage.container().style.cursor = '';
+    this.stage.container().style.cursor = '';
     this.mount.style.userSelect = '';
   }
   _isOnShape(target, kind) {
@@ -874,6 +704,7 @@ export class Board {
     this._setSliderFromZoom(Math.round(this.zoom * 100));
   }
 
+  // ---------- RESTORED: controls wiring ----------
   _wireControls() {
     const { zoomPctEl, sliderEl, zoomMinusBtn, zoomPlusBtn, recenterBtn } = this.controls;
 
@@ -916,8 +747,8 @@ export class Board {
 
     const BTN_MAX_PCT = Math.round(this.CFG.zoom.max * 100) - this.CFG.zoom.btnMaxBelowMaxPct;
     const curPct = () => Math.round(this.zoom * 100);
-    const nextDownStep = (p) => { const s = this.CFG.zoom.btnStepPct; const min = Math.round(this.minZoom*100); return Math.max(min, Math.floor((p-1)/s)*s); }
-    const nextUpStep   = (p)  => { const s = this.CFG.zoom.btnStepPct; return Math.min(BTN_MAX_PCT, Math.ceil((p+1)/s)*s); }
+    const nextDownStep = (p) => { const s = this.CFG.zoom.btnStepPct; const min = Math.round(this.minZoom*100); return Math.max(min, Math.floor((p-1)/s)*s); };
+    const nextUpStep   = (p)  => { const s = this.CFG.zoom.btnStepPct; return Math.min(BTN_MAX_PCT, Math.ceil((p+1)/s)*s); };
 
     const zoomToPctAnimated = (pTarget) => {
       const targetZoom = Math.max(this.minZoom, Math.min(this.CFG.zoom.max, pTarget / 100));
@@ -940,46 +771,6 @@ export class Board {
         this._animatePanTo(this.CFG.world.width / 2, this.CFG.world.height / 2)
       );
     }
-  }
-
-  // image fitting/centering inside the (scaled) frame
-  _setCardImage(node, url) {
-    const imgNode = node.findOne('.img');
-    const frame   = node.findOne('.imgFrame');
-    if (!imgNode || !frame) return;
-
-    if (!url) {
-      imgNode.visible(false);
-      imgNode.image(null);
-      return;
-    }
-
-    const targetW = frame.width();
-    const targetH = frame.height();
-
-    const img = new window.Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      const scale = Math.min(targetW / img.width, targetH / img.height);
-      const drawW = img.width * scale;
-      const drawH = img.height * scale;
-
-      imgNode.image(img);
-      imgNode.width(drawW);
-      imgNode.height(drawH);
-      imgNode.position({
-        x: frame.x() + (targetW - drawW) / 2,
-        y: frame.y() + (targetH - drawH) / 2,
-      });
-      imgNode.visible(true);
-      this.layer.batchDraw();
-    };
-    img.onerror = () => {
-      imgNode.visible(false);
-      imgNode.image(null);
-      this.layer.batchDraw();
-    };
-    img.src = url;
   }
 }
 
