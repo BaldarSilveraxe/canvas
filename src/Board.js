@@ -15,7 +15,7 @@ const DEFAULT_CFG = {
   pan: { animMs: 220 }
 };
 
-// ---------- NEW: base metrics + scaler ----------
+// ---------- Scaled UI metrics ----------
 const CARD_BASE = {
   w: 300,     // design width
   h: 150,     // design height
@@ -51,7 +51,10 @@ function computeCardMetrics(w, h) {
 
   return { sx, sy, s, pad, headerH, titleFont, imgSize, imgX, imgY, cornerR, strokeWidth, shadow };
 }
-// ------------------------------------------------
+
+// ---------- Shift-rotate snapping (15°) ----------
+const SNAP_DEG = 15;
+const SNAP_LIST = Array.from({ length: 360 / SNAP_DEG }, (_, i) => i * SNAP_DEG);
 
 const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
 
@@ -128,10 +131,37 @@ export class Board {
         const minW = 80, minH = 60;
         if (newBox.width < minW || newBox.height < minH) return oldBox;
         return newBox;
-      }
+      },
+      rotationSnaps: [] // will toggle on Shift
     });
     this.world.add(this.tr);
     this.tr.moveToTop();
+
+    // --- Shift-key snap setup ---
+    this._shiftDown = false;
+    this._applyRotationSnapMode = () => {
+      if (!this.tr) return;
+      this.tr.setAttrs({
+        rotationSnaps: this._shiftDown ? SNAP_LIST : [],
+        rotationSnapTolerance: 7
+      });
+      this.layer.batchDraw();
+    };
+    this._onKeyDown = (e) => {
+      if (e.key === 'Shift' && !this._shiftDown) {
+        this._shiftDown = true;
+        this._applyRotationSnapMode();
+      }
+    };
+    this._onKeyUp = (e) => {
+      if (e.key === 'Shift' && this._shiftDown) {
+        this._shiftDown = false;
+        this._applyRotationSnapMode();
+      }
+    };
+    window.addEventListener('keydown', this._onKeyDown);
+    window.addEventListener('keyup', this._onKeyUp);
+    this._applyRotationSnapMode();
 
     // world visuals
     this._buildWorld();
@@ -390,7 +420,6 @@ export class Board {
     return { cx: Math.min(Math.max(minX, cx), maxX), cy: Math.min(Math.max(minY, cy), maxY) };
   }
 
-  // ---------- CHANGED: shadow scales ----------
   _applyShadowToBody(body, shadowScale = { dx: this.cardShadow.dx, dy: this.cardShadow.dy, blur: this.cardShadow.blur, opacity: this.cardShadow.opacity }) {
     if (!body) return;
     if (this.cardShadow.enabled) {
@@ -405,7 +434,7 @@ export class Board {
     }
   }
 
-  // ---------- CHANGED: build skin with scaled metrics ----------
+  // build/replace the styled body+header via cardStyles.js
   _buildCardSkin(node, model) {
     const M = computeCardMetrics(model.w, model.h);
 
@@ -427,11 +456,9 @@ export class Board {
     const body = skin.findOne('.body');
     this._applyShadowToBody(body, M.shadow);
 
-    // (Optionally) scale header block height if present
+    // scale header height if present (style may override)
     const headerNode = skin.findOne('.header');
-    if (headerNode && typeof headerNode.height === 'function') {
-      headerNode.height(M.headerH);
-    }
+    if (headerNode?.height) headerNode.height(M.headerH);
 
     node.add(skin);
 
@@ -440,10 +467,7 @@ export class Board {
     let img   = node.findOne('.img');
     let frame = node.findOne('.imgFrame');
 
-    // header height used for layout of title/img
     const headerH = headerNode?.height?.() ?? M.headerH;
-
-    // ----- image slot (scaled) -----
     const imgSize = M.imgSize;
     const imgX = M.imgX;
     const imgY = M.imgY;
@@ -469,7 +493,6 @@ export class Board {
       frame.fillEnabled(false);
     }
 
-    // ----- title (scaled) -----
     const titleX = M.pad;
     const titleY = Math.max(4, M.pad * 0.5);
     const titleW = model.w - (M.pad * 2);
@@ -631,11 +654,20 @@ export class Board {
     this.tr.nodes([node]);
     this.tr.getLayer()?.batchDraw();
 
-    // live inspector values while resizing/rotating
+    // live inspector values while resizing/rotating + manual snap fallback
     node.off('transform.board');
     node.on('transform.board', () => {
       const m = this.SHAPES.get(id);
       if (!m) return;
+
+      // Manual snap if rotating with Shift (fallback for environments where rotationSnaps might not apply)
+      const active = typeof this.tr.getActiveAnchor === 'function' ? this.tr.getActiveAnchor() : null;
+      if (this._shiftDown && active === 'rotater') {
+        const raw = node.rotation();
+        const snapped = Math.round(raw / SNAP_DEG) * SNAP_DEG;
+        if (snapped !== raw) node.rotation(snapped);
+      }
+
       const w = Math.round((m.w ?? CARD_BASE.w) * node.scaleX());
       const h = Math.round((m.h ?? CARD_BASE.h) * node.scaleY());
       const rot = Math.round(node.rotation());
@@ -650,7 +682,13 @@ export class Board {
 
       const newW = Math.max(80, (m.w ?? CARD_BASE.w) * node.scaleX());
       const newH = Math.max(60, (m.h ?? CARD_BASE.h) * node.scaleY());
-      const newRot = node.rotation();
+      let newRot = node.rotation();
+
+      // final snap if Shift still held at end
+      if (this._shiftDown) {
+        newRot = Math.round(newRot / SNAP_DEG) * SNAP_DEG;
+        node.rotation(newRot);
+      }
 
       m.w = newW;
       m.h = newH;
@@ -800,7 +838,7 @@ export class Board {
     this.isPanning = false;
     this.panStart = null;
     this.scrollStart = null;
-    this.stage.container().style.cursor = '';
+       this.stage.container().style.cursor = '';
     this.mount.style.userSelect = '';
   }
   _isOnShape(target, kind) {
