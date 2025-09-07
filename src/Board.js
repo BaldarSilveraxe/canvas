@@ -425,8 +425,23 @@ export class Board {
         x: 12, y: headerH + 10, width: imgSize, height: imgSize,
         cornerRadius: 6, stroke: '#2d3741', strokeWidth: 1, fill: '#0d1115'
       });
-
+      
       node.add(body, header, title, imgRect);
+      
+      if (next.img) {
+        // Load the image asynchronously
+        const image = new Image();
+        image.src = next.img;
+        image.onload = () => {
+          const cardImage = new Konva.Image({
+            image: image,
+            x: 12, y: headerH + 10, width: imgSize, height: imgSize,
+            listening: false // important: don't let it block clicks on the card
+          });
+          node.add(cardImage);
+          this.layer.batchDraw();
+        };
+      }
 
       if (typeof next.rot === 'number') node.rotation(next.rot);
 
