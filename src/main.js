@@ -111,6 +111,20 @@ const selZ = $('selZ'), selOrderLabel = $('selOrderLabel');
 
 let selectedId = null;
 
+function setInspectorEnabled(enabled) {
+  [selCx, selCy, selW, selH, selRot, selZ].forEach(el => el.disabled = !enabled);
+}
+
+function clearInspector() {
+  selCx.value = '';
+  selCy.value = '';
+  selW.value  = '';
+  selH.value  = '';
+  selRot.value = '';
+  selZ.value = '';
+  selOrderLabel.textContent = '—';
+}
+
 function refreshCardDropdown() {
   // cards in draw order (back->front)
   const cards = board.getCards();
@@ -133,7 +147,6 @@ function refreshCardDropdown() {
 
 function formatOrderLabel(z, total) {
   if (typeof z !== 'number' || total <= 0) return '—';
-  // z: 0..N-1 (0 = back). Show human-friendly: "pos / N (Front|Back)"
   const pos = z + 1;
   const frontIdx = total - 1;
   const tag = (z === frontIdx) ? 'Top' : (z === 0 ? 'Bottom' : '');
@@ -165,12 +178,34 @@ function updateInspector() {
 
 selCard.addEventListener('change', () => {
   selectedId = selCard.value;
+  // make the board actually select it so transformer + status update
+  if (selectedId) board.selectCard(selectedId);
   updateInspector();
 });
 
 // Hook board callbacks for inspector + z-order persistence demo
 board.setCallbacks({
+  // NEW: selection state from the canvas (clicks, drag start/end, background clicks, Esc)
+  onSelectionChange: (state, id /*, meta */) => {
+    selStatus.textContent = state;
+    if (state === 'idle' || !id) {
+      selectedId = null;
+      selCard.value = '';
+      setInspectorEnabled(false);
+      clearInspector();
+      return;
+    }
+    // selected or dragging
+    selectedId = id;
+    // keep dropdown in sync with canvas
+    if (selCard.value !== id) selCard.value = id;
+    setInspectorEnabled(true);
+    updateInspector();
+  },
+
   onDragStart: (id) => {
+    // canvas already emits onSelectionChange('dragging', id),
+    // this keeps parity if you depended on the old hooks
     if (id === selectedId) selStatus.textContent = 'dragging';
   },
   onDrag: (id, pos) => {
@@ -181,21 +216,21 @@ board.setCallbacks({
   },
   onDragEnd: (id, pos) => {
     if (id === selectedId) {
-      selStatus.textContent = 'idle';
+      // IMPORTANT CHANGE: after drag we stay selected
+      selStatus.textContent = 'selected';
       selCx.value = Math.round(pos.cx);
       selCy.value = Math.round(pos.cy);
     }
   },
-  // NEW: z-order has changed; persist to DB here
   onZOrderChange: (order) => {
-    // Demo: log it; in real app, POST to server, then update local models w/ returned truth
     console.log('z-order changed:', order);
-    // keep inspector in sync
     updateInspector();
-    // Also refresh dropdown to reflect draw order (optional)
     refreshCardDropdown();
   }
 });
 
 // Initial population of selection list
 refreshCardDropdown();
+// Start with inspector disabled until something is selected
+setInspectorEnabled(false);
+selStatus.textContent = 'idle';
