@@ -22,26 +22,20 @@ const DEFAULT_CFG = {
   pan: { animMs: 220 }
 };
 
-// Shift-rotate snapping (15°)
 const SNAP_DEG = 15;
 const SNAP_LIST = Array.from({ length: 360 / SNAP_DEG }, (_, i) => i * SNAP_DEG);
-
 const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
 
 export class Board {
   constructor({ mount, controls = {}, config = {} }) {
     if (!mount) throw new Error('Board: mount element is required');
-
     this.CFG = deepMerge(structuredClone(DEFAULT_CFG), config);
 
-    // world + grid styles
     this.worldStyle = { top: '#0f1418', bottom: '#0b0f13', stroke: '#2a3238' };
     this.gridStyle  = { spacing: 100, heavyEvery: 500, light: '#1c242a', heavy: '#2f3a41' };
-
-    // card shadow style (global; each card scales it from metrics)
     this.cardShadow = { enabled: true, dx: 6, dy: 6, blur: 6, color: '#000000', opacity: 0.35 };
 
-    // DOM scaffolding
+    // --- DOM + Stage ---
     this.mount = mount;
     this.mount.style.position = 'relative';
     this.mount.style.overflow = 'auto';
@@ -64,18 +58,20 @@ export class Board {
         `translate(${this.mount.scrollLeft}px, ${this.mount.scrollTop}px)`;
     };
 
-    // Stage/Layer/World
     this.stage = new Konva.Stage({
       container: this.stageHost,
       width: this.stageHost.clientWidth,
       height: this.stageHost.clientHeight
     });
+    // Make keyboard events reliable
+    this.stage.container().tabIndex = 0;
+    this.stage.container().style.outline = 'none';
+
     this.layer = new Konva.Layer();
     this.world = new Konva.Group({ x: 0, y: 0, scaleX: 1, scaleY: 1 });
     this.layer.add(this.world);
     this.stage.add(this.layer);
 
-    // z buckets
     this.groups = {
       background:   new Konva.Group({ name: 'g-background' }),
       grid:         new Konva.Group({ name: 'g-grid' }),
@@ -93,7 +89,6 @@ export class Board {
       this.groups.pins
     );
 
-    // Transformer with rot snap (Shift)
     this.tr = new Konva.Transformer({
       rotateEnabled: true,
       boundBoxFunc: (oldBox, newBox) => {
@@ -106,8 +101,8 @@ export class Board {
     this.world.add(this.tr);
     this.tr.moveToTop();
 
-    // --- State & hooks ---
-    this.state = 'idle'; // 'idle' | 'selected' | 'dragging'
+    // --- State + Hooks ---
+    this.state = 'idle'; // 'idle' | 'selected' | 'dragging' | 'deleted'
     this.selectedId = null;
 
     this.Hooks = {
@@ -115,7 +110,9 @@ export class Board {
       onDrag: ()=>{},
       onDragEnd: ()=>{},
       onZOrderChange: ()=>{},
-      onSelectionChange: ()=>{} // (state, id, meta)
+      onSelectionChange: ()=>{},  // (state, id, meta)
+      onDelete: ()=>true,         // return false to veto deletion
+      onDeleted: ()=>{}           // called after removal
     };
 
     this._emitSelection = (state, id, meta = {}) => {
@@ -123,7 +120,7 @@ export class Board {
       this.Hooks.onSelectionChange?.(state, id ?? null, meta);
     };
 
-    // Shift-key toggling of rotation snaps + Escape to clear selection
+    // --- Keys: Shift snap / Esc clear / Delete remove ---
     this._shiftDown = false;
     this._applyRotationSnapMode = () => {
       if (!this.tr) return;
@@ -133,12 +130,24 @@ export class Board {
       });
       this.layer.batchDraw();
     };
+
     this._onKeyDown = (e) => {
       if (e.key === 'Shift' && !this._shiftDown) {
         this._shiftDown = true;
         this._applyRotationSnapMode();
       }
       if (e.key === 'Escape') this.clearSelection();
+
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (this._isTypingTarget(e.target)) return;
+        if (this.selectedId) {
+          const ok = this.Hooks.onDelete?.(this.selectedId) !== false;
+          if (!ok) return;
+          this.removeSelectedCard();
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }
     };
     this._onKeyUp = (e) => {
       if (e.key === 'Shift' && this._shiftDown) {
@@ -146,28 +155,28 @@ export class Board {
         this._applyRotationSnapMode();
       }
     };
+    this.stage.container().addEventListener('keydown', this._onKeyDown);
+    this.stage.container().addEventListener('keyup', this._onKeyUp);
     window.addEventListener('keydown', this._onKeyDown);
     window.addEventListener('keyup', this._onKeyUp);
     this._applyRotationSnapMode();
 
-    // world visuals
+    // --- Visuals & Data ---
     this._buildWorld();
+    this.SHAPES = new Map();
+    this.SHAPE_NODES = new Map();
 
-    // models + nodes
-    this.SHAPES = new Map();      // id -> model
-    this.SHAPE_NODES = new Map(); // id -> Konva.Group
-
-    // camera
+    // --- Camera ---
     this.zoom = 1;
     this.camera = { x: 0, y: 0 };
     this.minZoom = this.CFG.zoom.hardMin;
     this.suppressScrollSync = false;
 
-    // controls
+    // --- Controls ---
     this.controls = controls;
     this._wireControls();
 
-    // scroll sync
+    // Scroll sync
     this.mount.addEventListener('scroll', () => {
       if (this.suppressScrollSync) return;
       this.pinOverlayToScroll();
@@ -177,7 +186,7 @@ export class Board {
       this._render();
     });
 
-    // zoom (Alt + wheel)
+    // Zoom (Alt+Wheel)
     this.stage.on('wheel', (e) => {
       if (e.evt.ctrlKey || !e.evt.altKey) return;
       e.evt.preventDefault();
@@ -189,17 +198,17 @@ export class Board {
       this._animateZoomTo(this.zoom * factor, anchorWorld, ptr);
     });
 
-    // pan + background click clears selection
+    // Pan + background click -> clear selection & focus canvas
     this.isPanning = false; this.panStart = null; this.scrollStart = null;
     this.stage.on('mousedown', (e) => {
+      this.stage.container().focus(); // focus canvas for Delete hotkey
       const parent = e.target && e.target.getParent && e.target.getParent();
       const isTransformerHandle = !!(parent && parent.getClassName && parent.getClassName() === 'Transformer');
       if (isTransformerHandle) return;
 
-      if (e.evt.button !== 0) return;         // only left
-      if (this._isOnShape(e.target)) return;  // let shapes drag/transform
+      if (e.evt.button !== 0) return;
+      if (this._isOnShape(e.target)) return;
 
-      // Clicked empty space: clear selection before pan
       this.clearSelection();
       this._startPanAtPointer();
     });
@@ -219,7 +228,6 @@ export class Board {
       this.suppressScrollSync = false;
     });
 
-    // resize + initial center
     new ResizeObserver(() => this._resizeStageToViewport()).observe(this.mount);
     window.addEventListener('resize', () => this._resizeStageToViewport());
 
@@ -232,7 +240,6 @@ export class Board {
 
   clearSelection() {
     if (!this.selectedId) {
-      // still emit in case UI wants to force 'idle'
       this._emitSelection('idle', null);
       return;
     }
@@ -241,6 +248,19 @@ export class Board {
     this.tr.nodes([]);
     this.tr.getLayer()?.batchDraw();
     this._emitSelection('idle', null, { prev });
+  }
+
+  removeSelectedCard() {
+    if (!this.selectedId) return;
+    this.removeCard(this.selectedId);
+  }
+
+  removeCard(id) {
+    if (!id) return;
+    this._removeShape(id);
+    this._normalizeAndEmitCardOrder();
+    this.layer.batchDraw();
+    this.Hooks.onDeleted?.(id);
   }
 
   applySnapshot(arr) {
@@ -259,7 +279,7 @@ export class Board {
     this.layer.batchDraw();
   }
 
-  // Camera helpers
+  // Camera helpers...
   center() { this._animatePanTo(this.CFG.world.width/2, this.CFG.world.height/2); }
   setZoomPct(pct){
     const c={x:this.stage.width()/2,y:this.stage.height()/2};
@@ -277,7 +297,7 @@ export class Board {
     return { x: rect.left + (worldX - this.camera.x)*this.zoom, y: rect.top + (worldY - this.camera.y)*this.zoom };
   }
 
-  // Styling APIs
+  // Styling APIs...
   setGridVisible(flag) {
     if (!this.groups?.grid) return;
     this.groups.grid.visible(!!flag);
@@ -313,27 +333,56 @@ export class Board {
     }
   }
 
-  setCardShadowStyle({ enabled, dx, dy, blur, color, opacity } = {}) {
-    if (enabled != null) this.cardShadow.enabled = !!enabled;
-    if (dx      != null) this.cardShadow.dx = +dx || 0;
-    if (dy      != null) this.cardShadow.dy = +dy || 0;
-    if (blur    != null) this.cardShadow.blur = +blur || 0;
-    if (color   != null) this.cardShadow.color = color;
-    if (opacity != null) this.cardShadow.opacity = Math.max(0, Math.min(1, +opacity));
+setCardShadowStyle({ enabled, dx, dy, blur, color, opacity } = {}) {
+  // 1) Update the global shadow model
+  if (enabled != null) this.cardShadow.enabled = !!enabled;
+  if (dx      != null) this.cardShadow.dx      = Number(dx) || 0;
+  if (dy      != null) this.cardShadow.dy      = Number(dy) || 0;
+  if (blur    != null) this.cardShadow.blur    = Math.max(0, Number(blur) || 0);
+  if (color   != null) this.cardShadow.color   = color;
+  if (opacity != null) this.cardShadow.opacity = Math.max(0, Math.min(1, Number(opacity)));
 
-    // Re-apply to each card using its own metrics (scaled)
-    this.groups.cards.getChildren().forEach(g => {
-      const id = g.getAttr('shapeId');
-      const m  = this.SHAPES.get(id);
-      const body = g.findOne('.body');
-      if (!m || !body) return;
-      const M = computeCardMetrics(m.w, m.h);
-      applyShadowToBody(body, this.cardShadow, M.shadow);
+  // 2) Apply to all existing cards immediately (scaled by card size)
+  const BASE_W = 300; // default card base width
+  const BASE_H = 150; // default card base height
+
+  const nodes = this.groups.cards.getChildren(n =>
+    n.hasName('shape') && n.getAttr('shapeKind') === 'card'
+  );
+
+  nodes.forEach(g => {
+    const id = g.getAttr('shapeId');
+    const m  = this.SHAPES.get(id);
+    const body = g.findOne('.body');
+
+    if (!m || !body) return;
+
+    // Scale shadow with card size (simple, predictable)
+    const scaleX = (m.w || BASE_W) / BASE_W;
+    const scaleY = (m.h || BASE_H) / BASE_H;
+    const k = Math.max(scaleX, scaleY); // keep it beefy as cards grow
+
+    if (!this.cardShadow.enabled) {
+      body.shadowEnabled(false);
+      body.shadowBlur(0);
+      body.shadowOpacity(0);
+      body.shadowOffset({ x: 0, y: 0 });
+      return;
+    }
+
+    body.shadowEnabled(true);
+    body.shadowColor(this.cardShadow.color);
+    body.shadowOpacity(this.cardShadow.opacity);
+    body.shadowBlur(this.cardShadow.blur * k);
+    body.shadowOffset({
+      x: this.cardShadow.dx * k,
+      y: this.cardShadow.dy * k
     });
-    this.layer.batchDraw();
-  }
+  });
 
-  // Z-Order helpers
+  this.layer.batchDraw();
+}
+
   getCardOrder() {
     const nodes = this.groups.cards.getChildren(n => n.hasName('shape') && n.getAttr('shapeKind') === 'card');
     return nodes.map((n, idx) => ({ id: n.getAttr('shapeId'), z: idx }));
@@ -356,7 +405,6 @@ export class Board {
   // ---------- INTERNALS ----------
   _buildWorld() {
     const W = this.CFG.world.width, H = this.CFG.world.height;
-
     this.worldBG = new Konva.Rect({
       x: 0, y: 0, width: W, height: H,
       fillLinearGradientStartPoint: { x: 0, y: 0 },
@@ -378,12 +426,14 @@ export class Board {
         const heavyEach = shape.getAttr('heavyEvery');
         const lightCol  = shape.getAttr('lightColor');
         const heavyCol  = shape.getAttr('heavyColor');
+        // light lines
         ctx.beginPath(); ctx.strokeStyle = lightCol; ctx.lineWidth = 1;
         for (let x = 0; x <= gridW; x += spacing)
           if (x % heavyEach !== 0) { ctx.moveTo(x + 0.5, 0.5); ctx.lineTo(x + 0.5, gridH + 0.5); }
         for (let y = 0; y <= gridH; y += spacing)
           if (y % heavyEach !== 0) { ctx.moveTo(0.5, y + 0.5); ctx.lineTo(gridW + 0.5, y + 0.5); }
         ctx.stroke();
+        // heavy lines
         ctx.beginPath(); ctx.strokeStyle = heavyCol; ctx.lineWidth = 2;
         for (let x = 0; x <= gridW; x += heavyEach) { ctx.moveTo(x + 0.5, 0.5); ctx.lineTo(x + 0.5, gridH + 0.5); }
         for (let y = 0; y <= gridH; y += heavyEach) { ctx.moveTo(0.5, y + 0.5); ctx.lineTo(gridW + 0.5, y + 0.5); }
@@ -392,6 +442,7 @@ export class Board {
     });
     this.groups.grid.add(this.gridShape);
 
+    // corner markers (debug)
     const addDot = (x,y)=>this.groups.background.add(new Konva.Circle({ x,y, radius:3, fill:'#9AE6B4' }));
     const addLbl = (x,y,t)=>this.groups.background.add(new Konva.Text({ x,y, text:t, fill:'#9AE6B4', fontSize:12, fontFamily:'ui-monospace, monospace' }));
     addDot(0,0);       addLbl(8,4,'0,0');
@@ -441,11 +492,13 @@ export class Board {
       node.setAttr('shapeKind', 'card');
 
       buildCardSkin(node, next, this.cardShadow);
-
       if (typeof next.rot === 'number') node.rotation(next.rot);
 
       node.on('mouseenter', () => this.stage.container().style.cursor = 'grab');
-      node.on('mousedown',  () => this.stage.container().style.cursor = 'grabbing');
+      node.on('mousedown',  () => {
+        this.stage.container().focus();
+        this.stage.container().style.cursor = 'grabbing';
+      });
       node.on('mouseup',    () => this.stage.container().style.cursor = 'grab');
       node.on('mouseleave', () => this.stage.container().style.cursor = '');
 
@@ -473,32 +526,21 @@ export class Board {
         next.cx = p.cx; next.cy = p.cy;
         this.Hooks.onDragEnd(next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
         this._normalizeAndEmitCardOrder();
-        // Remain selected after drag
         this._emitSelection('selected', next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
       });
 
-      // Select immediately on press; stop bubbling so stage doesn't pan/clear
-      node.on('mousedown touchstart', (e) => {
-        this.selectCard(next.id);
-        e.cancelBubble = true;
-      });
-      node.on('click tap', (e) => {
-        this.selectCard(next.id);
-        e.cancelBubble = true;
-      });
+      node.on('mousedown touchstart', (e) => { this.selectCard(next.id); e.cancelBubble = true; });
+      node.on('click tap', (e) => { this.selectCard(next.id); e.cancelBubble = true; });
 
       this.groups.cards.add(node);
       this.SHAPE_NODES.set(next.id, node);
-
       if (typeof next.z === 'number') node.zIndex(next.z);
 
     } else {
       const sizeChanged = (next.w !== prev.w) || (next.h !== prev.h);
       const styleChanged = next.styleKey !== prev?.styleKey
-        || next.stroke !== prev?.stroke
-        || next.strokeWidth !== prev?.strokeWidth
-        || next.bodyFill !== prev?.bodyFill
-        || next.headerFill !== prev?.headerFill;
+        || next.stroke !== prev?.stroke || next.strokeWidth !== prev?.strokeWidth
+        || next.bodyFill !== prev?.bodyFill || next.headerFill !== prev?.headerFill;
 
       node.position({ x: next.cx, y: next.cy });
       if (typeof next.rot === 'number') node.rotation(next.rot);
@@ -511,48 +553,37 @@ export class Board {
         if (title && next.title != null) title.text(next.title);
         setCardImage(node, next.img);
       }
-
       if (typeof next.z === 'number') node.zIndex(next.z);
     }
   }
 
-  // Selection + transform
   selectCard(id) {
     const node = this.SHAPE_NODES.get(id);
     if (!node) return;
 
-    // Short-circuit if same selection (still emit 'selected' for UI consistency)
     this.selectedId = id;
-
-    // attach transformer
     this.tr.nodes([node]);
     this.tr.getLayer()?.batchDraw();
 
-    // Notify UI
     const m = this.SHAPES.get(id);
     this._emitSelection('selected', id, m ? { cx: m.cx, cy: m.cy, w: m.w, h: m.h, rot: m.rot ?? 0 } : {});
 
-    // live inspector values while resizing/rotating + manual snap fallback
     node.off('transform.board');
     node.on('transform.board', () => {
       const mm = this.SHAPES.get(id);
       if (!mm) return;
-
-      // Manual snap if rotating with Shift (fallback for environments where rotationSnaps might not apply)
       const active = typeof this.tr.getActiveAnchor === 'function' ? this.tr.getActiveAnchor() : null;
       if (this._shiftDown && active === 'rotater') {
         const raw = node.rotation();
         const snapped = Math.round(raw / SNAP_DEG) * SNAP_DEG;
         if (snapped !== raw) node.rotation(snapped);
       }
-
       const w = Math.round((mm.w ?? CARD_BASE.w) * node.scaleX());
       const h = Math.round((mm.h ?? CARD_BASE.h) * node.scaleY());
       const rot = Math.round(node.rotation());
       this.Hooks.onDrag?.(id, { cx: mm.cx, cy: mm.cy, w, h, rot });
     });
 
-    // commit w/h/rot on transform end (avoid snap-back)
     node.off('transformend.board');
     node.on('transformend.board', () => {
       const mm = this.SHAPES.get(id);
@@ -580,34 +611,38 @@ export class Board {
       this.tr.getLayer()?.batchDraw();
 
       this.Hooks.onDragEnd?.(id, { cx: mm.cx, cy: mm.cy, w: mm.w, h: mm.h, rot: mm.rot });
-
-      // After transform, still selected
       this._emitSelection('selected', id, { cx: mm.cx, cy: mm.cy, w: mm.w, h: mm.h, rot: mm.rot });
     });
   }
 
   _removeShape(id) {
+    // Emit 'deleted' with last known meta BEFORE removal
+    const m = this.SHAPES.get(id);
+    if (m) {
+      this._emitSelection('deleted', id, {
+        cx: m.cx, cy: m.cy, w: m.w, h: m.h, rot: m.rot ?? 0, title: m.title ?? id
+      });
+    }
+
     this.SHAPES.delete(id);
     const node = this.SHAPE_NODES.get(id);
     if (node) { node.destroy(); this.SHAPE_NODES.delete(id); }
+
     if (this.selectedId === id) {
       this.selectedId = null;
       this.tr.nodes([]);
       this.tr.getLayer()?.batchDraw();
-      this._emitSelection('idle', null);
+      // NOTE: do NOT auto-emit 'idle' here; let the app show 'deleted' first.
     }
   }
 
-  // camera + UI
+  // --- camera, controls, utils (unchanged except for _isTypingTarget) ---
   _getFitMinZoom() {
     const vw = this.mount.clientWidth  || 1;
     const vh = this.mount.clientHeight || 1;
     return Math.max(this.CFG.zoom.hardMin, vw / this.CFG.world.width, vh / this.CFG.world.height);
   }
-  _updateSpacer() {
-    this.spacer.style.width  = `${this.CFG.world.width  * this.zoom}px`;
-    this.spacer.style.height = `${this.CFG.world.height * this.zoom}px`;
-  }
+  _updateSpacer() { this.spacer.style.width  = `${this.CFG.world.width  * this.zoom}px`; this.spacer.style.height = `${this.CFG.world.height * this.zoom}px`; }
   _clampCamera() {
     const vw = this.stage.width(), vh = this.stage.height();
     const maxX = Math.max(0, this.CFG.world.width  - vw / this.zoom);
@@ -615,11 +650,7 @@ export class Board {
     this.camera.x = Math.min(Math.max(0, this.camera.x), maxX);
     this.camera.y = Math.min(Math.max(0, this.camera.y), maxY);
   }
-  _render() {
-    this.world.scale({ x: this.zoom, y: this.zoom });
-    this.world.position({ x: -this.camera.x * this.zoom, y: -this.camera.y * this.zoom });
-    this.layer.batchDraw();
-  }
+  _render() { this.world.scale({ x: this.zoom, y: this.zoom }); this.world.position({ x: -this.camera.x * this.zoom, y: -this.camera.y * this.zoom }); this.layer.batchDraw(); }
   _syncScrollFromCamera() {
     this.suppressScrollSync = true;
     this.mount.scrollLeft = this.camera.x * this.zoom;
@@ -627,18 +658,8 @@ export class Board {
     this.pinOverlayToScroll();
     this.suppressScrollSync = false;
   }
-  _setZoomLabel(pct) {
-    const { zoomPctEl } = this.controls;
-    if (zoomPctEl) zoomPctEl.textContent = `${pct}%`;
-  }
-  _setSliderFromZoom(pct) {
-    const { sliderEl } = this.controls;
-    if (!sliderEl || !sliderEl.noUiSlider) return;
-    this._suppressSlider = true;
-    sliderEl.noUiSlider.set(pct);
-    this._setZoomLabel(pct);
-    this._suppressSlider = false;
-  }
+  _setZoomLabel(pct) { const { zoomPctEl } = this.controls; if (zoomPctEl) zoomPctEl.textContent = `${pct}%`; }
+  _setSliderFromZoom(pct) { const { sliderEl } = this.controls; if (!sliderEl || !sliderEl.noUiSlider) return; this._suppressSlider = true; sliderEl.noUiSlider.set(pct); this._setZoomLabel(pct); this._suppressSlider = false; }
   _updateMinZoomAndUI({ animateIfRaised = true } = {}) {
     const newMin = Math.min(this._getFitMinZoom(), this.CFG.zoom.max);
     if (Math.abs(newMin - this.minZoom) > 1e-6) {
@@ -659,18 +680,7 @@ export class Board {
       if (this.zoom < this.minZoom && animateIfRaised) this._animateZoomToCenter(this.minZoom);
     }
   }
-
-  _animate({ duration, ease = easeOutCubic, update, done }) {
-    const t0 = performance.now();
-    const frame = (now) => {
-      const t = Math.min(1, (now - t0) / duration);
-      const e = ease(t);
-      update(e, t, now);
-      if (t < 1) requestAnimationFrame(frame);
-      else if (done) done();
-    };
-    requestAnimationFrame(frame);
-  }
+  _animate({ duration, ease = easeOutCubic, update, done }) { const t0 = performance.now(); const frame = (now)=>{ const t = Math.min(1, (now - t0) / duration); const e = ease(t); update(e, t, now); if (t < 1) requestAnimationFrame(frame); else if (done) done(); }; requestAnimationFrame(frame); }
   _animateZoomTo(targetZoom, anchorWorld, anchorScreen, duration = this.CFG.zoom.animMs) {
     targetZoom = Math.max(this.minZoom, Math.min(this.CFG.zoom.max, targetZoom));
     const startZoom = this.zoom;
@@ -728,6 +738,19 @@ export class Board {
     if (!kind) return true;
     return group.hasName(kind) || group.getAttr('shapeKind') === kind;
   }
+  _isTypingTarget(el) {
+    if (!el) return false;
+    if (el.isContentEditable) return true;
+    const tag = (el.tagName || '').toUpperCase();
+    if (tag === 'TEXTAREA') return true;
+    if (tag === 'INPUT') {
+      const type = (el.type || 'text').toLowerCase();
+      const TEXT_TYPES = ['text','search','email','url','tel','password','number'];
+      return TEXT_TYPES.includes(type);
+    }
+    return false; // <select> won't block delete
+  }
+
   _resizeStageToViewport() {
     const w = this.mount.clientWidth, h = this.mount.clientHeight;
     const cx = this.camera.x + (this.stage.width()  / (2 * this.zoom));
@@ -747,7 +770,7 @@ export class Board {
     this._updateMinZoomAndUI({ animateIfRaised: false });
     if (this.zoom < this.minZoom) this.zoom = this.minZoom;
     this._updateSpacer();
-    this.camera.x = cx - this.stage.width()  / (2 * this.zoom);
+       this.camera.x = cx - this.stage.width()  / (2 * this.zoom);
     this.camera.y = cy - this.stage.height() / (2 * this.zoom);
     this._clampCamera();
     this._syncScrollFromCamera();
@@ -755,7 +778,6 @@ export class Board {
     this._setSliderFromZoom(Math.round(this.zoom * 100));
   }
 
-  // ---------- controls wiring ----------
   _wireControls() {
     const { zoomPctEl, sliderEl, zoomMinusBtn, zoomPlusBtn, recenterBtn } = this.controls;
 
