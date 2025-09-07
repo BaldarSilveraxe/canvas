@@ -106,7 +106,24 @@ export class Board {
     this.world.add(this.tr);
     this.tr.moveToTop();
 
-    // Shift-key toggling of rotation snaps
+    // --- State & hooks ---
+    this.state = 'idle'; // 'idle' | 'selected' | 'dragging'
+    this.selectedId = null;
+
+    this.Hooks = {
+      onDragStart: ()=>true,
+      onDrag: ()=>{},
+      onDragEnd: ()=>{},
+      onZOrderChange: ()=>{},
+      onSelectionChange: ()=>{} // (state, id, meta)
+    };
+
+    this._emitSelection = (state, id, meta = {}) => {
+      this.state = state;
+      this.Hooks.onSelectionChange?.(state, id ?? null, meta);
+    };
+
+    // Shift-key toggling of rotation snaps + Escape to clear selection
     this._shiftDown = false;
     this._applyRotationSnapMode = () => {
       if (!this.tr) return;
@@ -121,6 +138,7 @@ export class Board {
         this._shiftDown = true;
         this._applyRotationSnapMode();
       }
+      if (e.key === 'Escape') this.clearSelection();
     };
     this._onKeyUp = (e) => {
       if (e.key === 'Shift' && this._shiftDown) {
@@ -138,15 +156,6 @@ export class Board {
     // models + nodes
     this.SHAPES = new Map();      // id -> model
     this.SHAPE_NODES = new Map(); // id -> Konva.Group
-    this.selectedId = null;
-
-    // hooks
-    this.Hooks = {
-      onDragStart: ()=>true,
-      onDrag: ()=>{},
-      onDragEnd: ()=>{},
-      onZOrderChange: ()=>{}
-    };
 
     // camera
     this.zoom = 1;
@@ -156,7 +165,7 @@ export class Board {
 
     // controls
     this.controls = controls;
-    this._wireControls(); // <-- this now exists ✅
+    this._wireControls();
 
     // scroll sync
     this.mount.addEventListener('scroll', () => {
@@ -180,14 +189,18 @@ export class Board {
       this._animateZoomTo(this.zoom * factor, anchorWorld, ptr);
     });
 
-    // pan
+    // pan + background click clears selection
     this.isPanning = false; this.panStart = null; this.scrollStart = null;
     this.stage.on('mousedown', (e) => {
       const parent = e.target && e.target.getParent && e.target.getParent();
       const isTransformerHandle = !!(parent && parent.getClassName && parent.getClassName() === 'Transformer');
       if (isTransformerHandle) return;
-      if (e.evt.button !== 0) return;
-      if (this._isOnShape(e.target)) return;
+
+      if (e.evt.button !== 0) return;         // only left
+      if (this._isOnShape(e.target)) return;  // let shapes drag/transform
+
+      // Clicked empty space: clear selection before pan
+      this.clearSelection();
       this._startPanAtPointer();
     });
     this.stage.on('dragstart', () => { if (this.isPanning) this._endPan(); });
@@ -216,6 +229,19 @@ export class Board {
 
   // ---------- PUBLIC API ----------
   setCallbacks(cb) { Object.assign(this.Hooks, cb || {}); }
+
+  clearSelection() {
+    if (!this.selectedId) {
+      // still emit in case UI wants to force 'idle'
+      this._emitSelection('idle', null);
+      return;
+    }
+    const prev = this.selectedId;
+    this.selectedId = null;
+    this.tr.nodes([]);
+    this.tr.getLayer()?.batchDraw();
+    this._emitSelection('idle', null, { prev });
+  }
 
   applySnapshot(arr) {
     const sorted = [...arr].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
@@ -433,6 +459,7 @@ export class Board {
         this.layer.batchDraw();
         const ok = this.Hooks.onDragStart(next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
         if (ok === false) { node.stopDrag(); return; }
+        this._emitSelection('dragging', next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
       });
       node.on('dragmove', () => {
         const p = this._clampCardCenter(node.x(), node.y(), next.w, next.h);
@@ -446,10 +473,19 @@ export class Board {
         next.cx = p.cx; next.cy = p.cy;
         this.Hooks.onDragEnd(next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
         this._normalizeAndEmitCardOrder();
+        // Remain selected after drag
+        this._emitSelection('selected', next.id, { cx: next.cx, cy: next.cy, w: next.w, h: next.h, rot: next.rot ?? 0 });
       });
 
-      node.on('mousedown touchstart', (e) => { this.selectCard(next.id); e.cancelBubble = true; });
-      node.on('click tap', (e) => { this.selectCard(next.id); e.cancelBubble = true; });
+      // Select immediately on press; stop bubbling so stage doesn't pan/clear
+      node.on('mousedown touchstart', (e) => {
+        this.selectCard(next.id);
+        e.cancelBubble = true;
+      });
+      node.on('click tap', (e) => {
+        this.selectCard(next.id);
+        e.cancelBubble = true;
+      });
 
       this.groups.cards.add(node);
       this.SHAPE_NODES.set(next.id, node);
@@ -484,17 +520,25 @@ export class Board {
   selectCard(id) {
     const node = this.SHAPE_NODES.get(id);
     if (!node) return;
+
+    // Short-circuit if same selection (still emit 'selected' for UI consistency)
     this.selectedId = id;
 
+    // attach transformer
     this.tr.nodes([node]);
     this.tr.getLayer()?.batchDraw();
 
+    // Notify UI
+    const m = this.SHAPES.get(id);
+    this._emitSelection('selected', id, m ? { cx: m.cx, cy: m.cy, w: m.w, h: m.h, rot: m.rot ?? 0 } : {});
+
+    // live inspector values while resizing/rotating + manual snap fallback
     node.off('transform.board');
     node.on('transform.board', () => {
-      const m = this.SHAPES.get(id);
-      if (!m) return;
+      const mm = this.SHAPES.get(id);
+      if (!mm) return;
 
-      // Manual snap on Shift if rotater active (fallback)
+      // Manual snap if rotating with Shift (fallback for environments where rotationSnaps might not apply)
       const active = typeof this.tr.getActiveAnchor === 'function' ? this.tr.getActiveAnchor() : null;
       if (this._shiftDown && active === 'rotater') {
         const raw = node.rotation();
@@ -502,19 +546,20 @@ export class Board {
         if (snapped !== raw) node.rotation(snapped);
       }
 
-      const w = Math.round((m.w ?? CARD_BASE.w) * node.scaleX());
-      const h = Math.round((m.h ?? CARD_BASE.h) * node.scaleY());
+      const w = Math.round((mm.w ?? CARD_BASE.w) * node.scaleX());
+      const h = Math.round((mm.h ?? CARD_BASE.h) * node.scaleY());
       const rot = Math.round(node.rotation());
-      this.Hooks.onDrag?.(id, { cx: m.cx, cy: m.cy, w, h, rot });
+      this.Hooks.onDrag?.(id, { cx: mm.cx, cy: mm.cy, w, h, rot });
     });
 
+    // commit w/h/rot on transform end (avoid snap-back)
     node.off('transformend.board');
     node.on('transformend.board', () => {
-      const m = this.SHAPES.get(id);
-      if (!m) return;
+      const mm = this.SHAPES.get(id);
+      if (!mm) return;
 
-      const newW = Math.max(80, (m.w ?? CARD_BASE.w) * node.scaleX());
-      const newH = Math.max(60, (m.h ?? CARD_BASE.h) * node.scaleY());
+      const newW = Math.max(80, (mm.w ?? CARD_BASE.w) * node.scaleX());
+      const newH = Math.max(60, (mm.h ?? CARD_BASE.h) * node.scaleY());
       let newRot = node.rotation();
 
       if (this._shiftDown) {
@@ -522,17 +567,22 @@ export class Board {
         node.rotation(newRot);
       }
 
-      m.w = newW; m.h = newH; m.rot = newRot;
+      mm.w = newW;
+      mm.h = newH;
+      mm.rot = newRot;
 
       node.scale({ x: 1, y: 1 });
       node.offset({ x: newW / 2, y: newH / 2 });
 
-      rebuildCardSkin(node, m, this.cardShadow);
+      rebuildCardSkin(node, mm, this.cardShadow);
 
       this.tr.nodes([node]);
       this.tr.getLayer()?.batchDraw();
 
-      this.Hooks.onDragEnd?.(id, { cx: m.cx, cy: m.cy, w: m.w, h: m.h, rot: m.rot });
+      this.Hooks.onDragEnd?.(id, { cx: mm.cx, cy: mm.cy, w: mm.w, h: mm.h, rot: mm.rot });
+
+      // After transform, still selected
+      this._emitSelection('selected', id, { cx: mm.cx, cy: mm.cy, w: mm.w, h: mm.h, rot: mm.rot });
     });
   }
 
@@ -544,6 +594,7 @@ export class Board {
       this.selectedId = null;
       this.tr.nodes([]);
       this.tr.getLayer()?.batchDraw();
+      this._emitSelection('idle', null);
     }
   }
 
@@ -704,7 +755,7 @@ export class Board {
     this._setSliderFromZoom(Math.round(this.zoom * 100));
   }
 
-  // ---------- RESTORED: controls wiring ----------
+  // ---------- controls wiring ----------
   _wireControls() {
     const { zoomPctEl, sliderEl, zoomMinusBtn, zoomPlusBtn, recenterBtn } = this.controls;
 
