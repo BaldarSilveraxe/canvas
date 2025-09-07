@@ -1,5 +1,6 @@
 // src/Board.js
 import Konva from 'https://esm.sh/konva@9';
+import { cardStyles } from './cardStyles.js';
 
 const DEFAULT_CFG = {
   world: { width: 6000, height: 6000 },
