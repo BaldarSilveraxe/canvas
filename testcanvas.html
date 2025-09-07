@@ -1,517 +1,281 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Konva Evidence Board — Pins Always Top, Shadows</title>
-  <style>
-    :root {
-      --bg: #0b0d0f; --fg: #cfe3d0;
-      --panel: rgba(16,18,22,.75); --border: #273036;
-      --acc1: #9AE6B4;
-    }
-    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); }
-    #board { width: 100vw; height: 100vh; display: block; }
-
-    .hud, .toolbar, .metrics, .toolbox {
-      position: fixed; background: var(--panel); border: 1px solid var(--border);
-      border-radius: 8px; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-      color: var(--fg); user-select: none;
-    }
-    .hud { left: 12px; top: 12px; padding: 8px 10px; }
-    .hud b { color: var(--acc1); }
-
-    .toolbar { right: 12px; top: 12px; display: flex; gap: 8px; padding: 8px; }
-    .toolbar button {
-      appearance: none; border: 1px solid var(--border); background: #11161a; color: var(--fg);
-      padding: 6px 10px; border-radius: 6px; cursor: pointer;
-    }
-
-    .toolbox {
-      right: 12px; bottom: 12px; padding: 10px; width: 280px; display: grid; gap: 8px;
-    }
-    .toolbox label { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; }
-    .toolbox input[type="color"] { width: 36px; height: 24px; padding: 0; border: 0; background: none; }
-    .toolbox input[type="range"] { width: 140px; }
-    .toolbox select { width: 140px; background: #11161a; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 4px; }
-
-    .metrics { left: 12px; bottom: 12px; padding: 8px 10px; max-width: 64ch; white-space: pre; }
-  </style>
-  <script src="https://unpkg.com/konva@9/konva.min.js"></script>
-</head>
-<body>
-  <div id="board"></div>
-
-  <div class="hud">
-    <b>Evidence Board</b> — Drag cards; strings auto-update.<br>
-    Pan: <b>Middle mouse</b> or <b>hold Space</b>. Wheel = zoom. Shift = snap.<br>
-    Click a card for <b>resize/rotate</b>. Drag the <b>pin</b> to move pivot/attach.
-  </div>
-
-  <div class="toolbar">
-    <button id="saveBtn"  title="Save to localStorage">Save</button>
-    <button id="loadBtn"  title="Load from localStorage">Load</button>
-    <button id="exportBtn" title="Export PNG">Export PNG</button>
-    <button id="resetBtn" title="Reset Zoom/Pan">Reset Zoom</button>
-  </div>
-
-  <div class="toolbox">
-    <label>Background <input type="color" id="bgColor" value="#0b0d0f" /></label>
-    <label>Pin color   <input type="color" id="pinColor" value="#a0aec0" /></label>
-    <label>Pin size    <input type="range" id="pinSize" min="2" max="20" step="1" value="6" /></label>
-    <label>String layer
-      <select id="stringLayer">
-        <option value="above" selected>Above cards</option>
-        <option value="below">Below cards</option>
-      </select>
-    </label>
-    <label>String color <input type="color" id="strColor" value="#d5c29f" /></label>
-    <label>String size  <input type="range" id="strSize" min="1" max="10" step="1" value="2" /></label>
-  </div>
-
-  <div class="metrics"><pre id="metricsPre"></pre></div>
-
-  <script>
-    // ---------------- Stage & Layers ----------------
-    const container = document.getElementById('board');
-    const stage = new Konva.Stage({ container, width: container.clientWidth, height: container.clientHeight });
-
-    // Order (bottom -> top): grid, (cards/strings), (strings/cards), endpointEnds, endpointPins
-    const gridLayer         = new Konva.Layer({ hitGraphEnabled: false });
-    const stringLayer       = new Konva.Layer({ listening: false }); // lines only
-    const cardLayer         = new Konva.Layer();
-    const endpointEndsLayer = new Konva.Layer({ listening: false }); // string endpoints
-    const endpointPinsLayer = new Konva.Layer({ listening: false }); // card pivot pins (always top)
-    stage.add(gridLayer, cardLayer, stringLayer, endpointEndsLayer, endpointPinsLayer);
-
-    // Helpers to convert ABS -> layer LOCAL space
-    const toStringLayer       = (absPt) => stringLayer.getAbsoluteTransform().copy().invert().point(absPt);
-    const toEndpointEndsLayer = (absPt) => endpointEndsLayer.getAbsoluteTransform().copy().invert().point(absPt);
-    const toEndpointPinsLayer = (absPt) => endpointPinsLayer.getAbsoluteTransform().copy().invert().point(absPt);
-
-    // ---------------- Grid ----------------
-    function drawGrid(spacing = 32) {
-      gridLayer.destroyChildren();
-      const w = stage.width(), h = stage.height();
-      const grid = new Konva.Shape({
-        listening: false,
-        sceneFunc: (ctx) => {
-          ctx.beginPath(); ctx.strokeStyle = '#12171b';
-          for (let y = 0; y <= h; y += spacing) { ctx.moveTo(0.5, y + 0.5); ctx.lineTo(w + 0.5, y + 0.5); }
-          ctx.stroke();
-          ctx.beginPath(); ctx.strokeStyle = '#1c2227';
-          for (let x = 0; x <= w; x += spacing) { ctx.moveTo(x + 0.5, 0.5); ctx.lineTo(x + 0.5, h + 0.5); }
-          ctx.stroke();
-        }
-      });
-      grid.cache({ pixelRatio: 1 });
-      gridLayer.add(grid);
-      gridLayer.batchDraw();
-    }
-    drawGrid();
-
-    // ---------------- Toolbox helpers ----------------
-    const $ = (id) => document.getElementById(id);
-    function setBackground(hex) {
-      document.documentElement.style.setProperty('--bg', hex);
-      document.body.style.background = hex;
-    }
-    function getStringColor() { return $('strColor').value; }
-    function getStringWidth() { return +$('strSize').value; }
-    function getEndpointRadius() {
-      const w = +$('strSize').value; // string stroke width
-      return Math.max(0.5, w / 2); // diameter = w
-    }
-    function getCardPinColor() { return $('pinColor').value; }
-    function getCardPinRadius() { return +$('pinSize').value; }
-
-    // ---------------- Card factory (movable pin = pivot) ----------------
-    function makeCard({ name, x, y, w = 200, h = 120, title = 'Untitled', color = '#cfe3d0', note = 'Notes…' }) {
-      const group = new Konva.Group({ x, y, draggable: true, name });
-
-      const shadow = new Konva.Rect({
-        x: 6, y: 6, width: w, height: h, cornerRadius: 12,
-        fill: 'rgba(0,0,0,0.35)', listening: false
-      });
-      const rect = new Konva.Rect({
-        width: w, height: h, cornerRadius: 12,
-        fillLinearGradientStartPoint: { x: 0, y: 0 },
-        fillLinearGradientEndPoint:   { x: 0, y: h },
-        fillLinearGradientColorStops: [0, '#1b2126', 1, '#11161a'],
-        stroke: '#3b4a52', strokeWidth: 2
-      });
-      const header = new Konva.Rect({ width: w, height: 28, cornerRadius: [12,12,0,0], fill: '#0f1317' });
-
-      const titleText = new Konva.Text({
-        text: title, x: 12, y: 6, width: w - 24, height: 20,
-        fontFamily: 'ui-monospace, monospace', fontSize: 14, fill: color
-      });
-      const bodyText = new Konva.Text({
-        text: note, x: 12, y: 40, width: w - 24, height: h - 52,
-        fontFamily: 'ui-monospace, monospace', fontSize: 12, fill: '#9bb0b9'
-      });
-
-      // Interactive pin inside card group (invisible; used for dragging & math)
-      const pin = new Konva.Circle({
-        x: w / 2, y: 16, radius: getCardPinRadius(),
-        fill: 'rgba(0,0,0,0)', stroke: 'rgba(0,0,0,0)', hitStrokeWidth: 18,
-        draggable: true, dragOnTop: false
-      });
-      // Constrain pin drag to card LOCAL rect even under transform
-      pin.dragBoundFunc((posAbs) => {
-        const inv = group.getAbsoluteTransform().copy().invert();
-        const local = inv.point(posAbs);
-        const clamped = { x: Math.max(0, Math.min(w, local.x)), y: Math.max(0, Math.min(h, local.y)) };
-        return group.getAbsoluteTransform().point(clamped);
-      });
-
-      group.add(shadow, rect, header, titleText, bodyText, pin);
-
-      // Visible pin overlay in endpointPinsLayer (always on top)
-      const pinOverlay = new Konva.Circle({
-        radius: getCardPinRadius(),
-        fill: getCardPinColor(),
-        shadowColor: '#000', shadowBlur: 6, shadowOpacity: 0.45, shadowOffsetY: 2,
-        listening: false
-      });
-      endpointPinsLayer.add(pinOverlay);
-
-      // Cursor UX
-      group.on('mouseenter', () => stage.container().style.cursor = 'grab');
-      group.on('mousedown',  () => stage.container().style.cursor = 'grabbing');
-      group.on('mouseup',    () => stage.container().style.cursor = 'grab');
-      group.on('mouseleave', () => stage.container().style.cursor = 'default');
-      pin.on('mouseenter',   () => stage.container().style.cursor = 'crosshair');
-      pin.on('mouseleave',   () => stage.container().style.cursor = 'default');
-
-      // Rotation pivot at pin; compensate position so card doesn't jump
-      function retargetPivotToPin(keepAttachAbs = true) {
-        const pinLocal = { x: pin.x(), y: pin.y() };
-        if (!keepAttachAbs) { group.offset(pinLocal); return; }
-        const tBefore = group.getAbsoluteTransform();
-        const before = tBefore.point(pinLocal);
-        group.offset(pinLocal);
-        const after = group.getAbsoluteTransform().point(pinLocal);
-        group.position({ x: group.x() + (before.x - after.x), y: group.y() + (before.y - after.y) });
-      }
-      retargetPivotToPin(false);
-      pin.on('dragmove', () => retargetPivotToPin(true));
-      pin.on('dragend',  () => retargetPivotToPin(true));
-
-      // Geometry helpers
-      group._meta = { name, w, h, pin, pinOverlay };
-      group.getCenterAbs = () => group.getAbsoluteTransform().point({ x: w / 2, y: h / 2 });
-      group.getAttachAbs = () => pin.getAbsolutePosition();
-
-      // Keep overlay pin synced (position + inverse scale)
-      group.updatePinOverlay = () => {
-        const abs = group.getAttachAbs();
-        const p = toEndpointPinsLayer(abs);
-        pinOverlay.position(p);
-        const inv = 1 / (stage.scaleX() || 1);
-        pinOverlay.scale({ x: inv, y: inv });
-      };
-
-      cardLayer.add(group);
-      return group;
-    }
-
-    // ---------------- String style helpers (toolbox-driven) ----------------
-    function getStringStyle() {
-      return { color: getStringColor(), width: getStringWidth(), endR: getEndpointRadius() };
-    }
-
-    // ---------------- Strings (attach at pin; lines in stringLayer; ends in endpointEndsLayer) ----------------
-    function connectAttachPoints(a, b) {
-      const { color, width, endR } = getStringStyle();
-
-      const line = new Konva.Line({
-        points: [0,0, 0,0, 0,0],
-        tension: 0.35,
-        stroke: color,
-        strokeWidth: width,
-        lineCap: 'round', lineJoin: 'round',
-        shadowColor: '#000', shadowBlur: 6, shadowOpacity: 0.35, shadowOffsetY: 2,
-        perfectDrawEnabled: false
-      });
-      line.strokeScaleEnabled(false);
-      stringLayer.add(line);
-
-      // Endpoints (always under card pins)
-      const pinA = new Konva.Circle({
-        radius: endR, fill: color,
-        shadowColor: '#000', shadowBlur: 6, shadowOpacity: 0.45, shadowOffsetY: 2,
-        listening: false
-      });
-      const pinB = pinA.clone();
-      endpointEndsLayer.add(pinA, pinB);
-
-      const connName = `${a._meta?.name ?? 'A'}→${b._meta?.name ?? 'B'}`;
-      let lastP1Abs = {x:0,y:0}, lastP2Abs = {x:0,y:0};
-
-      function update() {
-        const p1Abs = a.getAttachAbs();
-        const p2Abs = b.getAttachAbs();
-
-        // Draw curve in stringLayer space
-        const p1 = toStringLayer(p1Abs);
-        const p2 = toStringLayer(p2Abs);
-        const mx = (p1.x + p2.x) / 2;
-        const my = (p1.y + p2.y) / 2;
-        const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-        const sag = Math.min(60, Math.max(6, dist / 8));
-        line.points([ p1.x, p1.y, mx, my + sag, p2.x, p2.y ]);
-
-        // Endpoints in endpointEndsLayer space
-        const ep1 = toEndpointEndsLayer(p1Abs);
-        const ep2 = toEndpointEndsLayer(p2Abs);
-        pinA.position(ep1); pinB.position(ep2);
-
-        // Keep endpoint size constant on screen
-        const inv = 1 / (stage.scaleX() || 1);
-        pinA.scale({ x: inv, y: inv }); pinB.scale({ x: inv, y: inv });
-
-        lastP1Abs = p1Abs; lastP2Abs = p2Abs;
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Konva Layout Starter — ES Modules</title>
+    <style>
+      :root {
+        --bg: #0b0d0f;
+        --fg: #cfe3d0;
+        --panel: #E6CDAE;
+        --border: #273036;
+        --header-h: 5vh;
+        --left-w: 15vw;
+        --right-w: 15vw;
       }
 
-      const api = {
-        name: connName, line, pinA, pinB, update, a, b,
-        getEndpointsAbs: () => ({ p1: {...lastP1Abs}, p2: {...lastP2Abs} })
-      };
-
-      // Update when anything moves/transforms
-      a.on('dragmove transform', update);
-      b.on('dragmove transform', update);
-      a._meta.pin.on('dragmove', update);
-      b._meta.pin.on('dragmove', update);
-
-      update(); // initial render
-      return api;
-    }
-
-    // ---------------- Demo Cards ----------------
-    const left   = makeCard({ name: 'Left',   x: 60,  y: 160, title: 'Suspect: Mr. Green', color: '#b3f7c2', note: 'Seen near scene.\nAlibi unclear.' });
-    const center = makeCard({ name: 'Center', x: 360, y:  80, title: 'Key Lead: “The Note”', color: '#9AE6B4', note: 'Handwriting matches sample.' });
-    const right  = makeCard({ name: 'Right',  x: 720, y: 240, title: 'Victim: A. Sterling', color: '#93c5fd', note: 'COD: TBD.\nMotive: inheritance?' });
-
-    const cards = [left, center, right];
-    const links = [
-      connectAttachPoints(center, left),
-      connectAttachPoints(center, right)
-    ];
-
-    // ---------------- Transformer (resize + rotate @ movable pin) ----------------
-    const tr = new Konva.Transformer({
-      rotateEnabled: true,
-      enabledAnchors: ['top-left','top-right','bottom-left','bottom-right','top-center','bottom-center','middle-left','middle-right'],
-      anchorSize: 8,
-      borderStroke: '#9AE6B4',
-      anchorStroke: '#9AE6B4',
-      anchorFill: '#0b0d0f',
-      padding: 4
-    });
-    cardLayer.add(tr);
-
-    stage.on('click', (e) => {
-      const g = e.target.findAncestor('Group');
-      if (g && cards.includes(g)) tr.nodes([g]); else tr.nodes([]);
-    });
-    tr.on('transform transformend', () => { for (const l of links) l.update(); });
-
-    // ---------------- Pan & Zoom ----------------
-    let panningKey = false, panningMouse = false;
-    function setCursor(mode) { stage.container().style.cursor = mode; }
-    function startPan() { stage.draggable(true); setCursor('grab'); }
-    function stopPan()  { stage.draggable(false); setCursor('default'); }
-
-    stage.on('wheel', (e) => {
-      e.evt.preventDefault();
-      const old = stage.scaleX() || 1;
-      const pointer = stage.getPointerPosition();
-      const by = 1.05;
-      const dir = e.evt.deltaY > 0 ? -1 : 1;
-      const next = dir > 0 ? old * by : old / by;
-      const mousePointTo = { x: (pointer.x - stage.x()) / old, y: (pointer.y - stage.y()) / old };
-      stage.scale({ x: next, y: next });
-      stage.position({ x: pointer.x - mousePointTo.x * next, y: pointer.y - mousePointTo.y * next });
-    });
-    window.addEventListener('keydown', (e) => {
-      if (e.code === 'Space' && !panningKey) { panningKey = true; startPan(); }
-      if (e.key === 'Shift') window.__snap = true;
-    });
-    window.addEventListener('keyup', (e) => {
-      if (e.code === 'Space') { panningKey = false; if (!panningMouse) stopPan(); }
-      if (e.key === 'Shift') window.__snap = false;
-    });
-    stage.on('mousedown', (e) => {
-      if (e.evt.button === 1) { panningMouse = true; startPan(); e.evt.preventDefault(); }
-      else if (panningKey) { startPan(); }
-    });
-    stage.on('mouseup',   () => { if (panningMouse) { panningMouse = false; if (!panningKey) stopPan(); } else if (!panningKey) stopPan(); });
-    stage.on('mouseleave', () => { if (panningMouse && !panningKey) stopPan(); });
-
-    // ---------------- Toolbar (persist/export/reset) ----------------
-    const LS_KEY = 'evidence-board:v7-endpoints-below-pins';
-    function serialize() {
-      return {
-        cards: cards.map(g => ({
-          name: g._meta.name,
-          x: g.x(), y: g.y(),
-          scaleX: g.scaleX(), scaleY: g.scaleY(),
-          rotation: g.rotation(),
-          pin: { x: g._meta.pin.x(), y: g._meta.pin.y() }
-        })),
-        ui: {
-          bg: $('bgColor').value,
-          pinColor: $('pinColor').value,
-          pinSize: +$('pinSize').value,
-          strColor: $('strColor').value,
-          strSize: +$('strSize').value,
-          strLayer: $('stringLayer').value
-        }
-      };
-    }
-    function restore(state) {
-      if (!state) return;
-      if (state.cards) {
-        state.cards.forEach(d => {
-          const g = cards.find(c => c._meta.name === d.name);
-          if (!g) return;
-          g.position({ x: d.x, y: d.y });
-          g.scale({ x: d.scaleX ?? 1, y: d.scaleY ?? 1 });
-          g.rotation(d.rotation ?? 0);
-          if (d.pin) {
-            g._meta.pin.position({ x: d.pin.x, y: d.pin.y });
-            const pinLocal = { x: d.pin.x, y: d.pin.y };
-            const tBefore = g.getAbsoluteTransform();
-            const before = tBefore.point(pinLocal);
-            g.offset(pinLocal);
-            const after = g.getAbsoluteTransform().point(pinLocal);
-            g.position({ x: g.x() + (before.x - after.x), y: g.y() + (before.y - after.y) });
-          }
-        });
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
       }
-      if (state.ui) {
-        $('bgColor').value   = state.ui.bg       ?? $('bgColor').value;
-        $('pinColor').value  = state.ui.pinColor ?? $('pinColor').value;
-        $('pinSize').value   = state.ui.pinSize  ?? $('pinSize').value;
-        $('strColor').value  = state.ui.strColor ?? $('strColor').value;
-        $('strSize').value   = state.ui.strSize  ?? $('strSize').value;
-        $('stringLayer').value = state.ui.strLayer ?? $('stringLayer').value;
-        setBackground($('bgColor').value);
-        applyPinStyle();
-        applyStringStyle();
-        applyStringLayerOrder();
+
+      body {
+        display: grid;
+        grid-template-rows: var(--header-h) 1fr;
+        grid-template-columns: 100%;
+        height: 100vh;
+        font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
       }
-      for (const l of links) l.update();
-      stage.draw();
-    }
-    function saveBoard() { localStorage.setItem(LS_KEY, JSON.stringify(serialize())); }
-    function loadBoard() { const raw = localStorage.getItem(LS_KEY); if (!raw) return; restore(JSON.parse(raw)); }
-    function exportPNG() {
-      const uri = stage.toDataURL({ pixelRatio: 2, mimeType: 'image/png' });
-      const a = document.createElement('a'); a.download = 'evidence-board.png'; a.href = uri; a.click();
-    }
-    function resetZoom() { stage.scale({ x: 1, y: 1 }); stage.position({ x: 0, y: 0 }); stage.draw(); }
 
-    document.getElementById('saveBtn').addEventListener('click', saveBoard);
-    document.getElementById('loadBtn').addEventListener('click', loadBoard);
-    document.getElementById('exportBtn').addEventListener('click', exportPNG);
-    document.getElementById('resetBtn').addEventListener('click', resetZoom);
-
-    // ---------------- Toolbox wiring ----------------
-    function applyPinStyle() {
-      for (const c of cards) {
-        const po = c._meta.pinOverlay;
-        po.fill(getCardPinColor());
-        po.radius(getCardPinRadius());
+      header {
+        grid-row: 1;
+        grid-column: 1;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        background: #D28140;
+        border-bottom: 1px solid var(--border);
       }
-      endpointPinsLayer.batchDraw();
-    }
-    function applyStringStyle() {
-      const { color, width, endR } = getStringStyle();
-      for (const l of links) {
-        l.line.stroke(color);
-        l.line.strokeWidth(width);
-        l.pinA.fill(color); l.pinB.fill(color);
-        l.pinA.radius(endR); l.pinB.radius(endR);
+
+      .main {
+        grid-row: 2;
+        grid-column: 1;
+        display: grid;
+        grid-template-columns: var(--left-w) 1fr var(--right-w);
+        grid-template-rows: 100%;
+        min-height: 0;
       }
-      stringLayer.batchDraw();
-      endpointEndsLayer.batchDraw();
-    }
-    function applyStringLayerOrder() {
-      const mode = $('stringLayer').value; // 'above' or 'below'
-      if (mode === 'above') {
-        gridLayer.zIndex(0);
-        cardLayer.zIndex(1);
-        stringLayer.zIndex(2);
-      } else {
-        gridLayer.zIndex(0);
-        stringLayer.zIndex(1);
-        cardLayer.zIndex(2);
+
+      .panel {
+        min-height: 0;
+        min-width: 0;
+        border-right: 1px solid var(--border);
+        background: var(--panel);
+        color: #0b0d0f;
+        /* readable on light panel */
       }
-      // Endpoints, then card pins always on top
-      endpointEndsLayer.zIndex(3);
-      endpointPinsLayer.zIndex(4);
-      stage.draw();
-    }
 
-    // Initialize toolbox styles
-    setBackground($('bgColor').value);
-    applyPinStyle();
-    applyStringStyle();
-    applyStringLayerOrder();
-
-    $('bgColor').addEventListener('input', () => setBackground($('bgColor').value));
-    $('pinColor').addEventListener('input', applyPinStyle);
-    $('pinSize').addEventListener('input', applyPinStyle);
-    $('stringLayer').addEventListener('change', applyStringLayerOrder);
-    $('strColor').addEventListener('input', applyStringStyle);
-    $('strSize').addEventListener('input', applyStringStyle);
-
-    // ---------------- Metrics HUD ----------------
-    const metricsPre = document.getElementById('metricsPre');
-    const fmt = (n) => (Math.round(n * 10) / 10).toFixed(1);
-    function renderMetrics() {
-      const zoom = stage.scaleX() || 1;
-      let out = `Zoom: ${fmt(zoom)}x\nCards (center & attach pin; rot°):\n`;
-      for (const c of cards) {
-        const center = c.getCenterAbs();
-        const attach = c.getAttachAbs();
-        out += `  ${String(c._meta.name).padEnd(6)}  C(${fmt(center.x)}, ${fmt(center.y)})  A(${fmt(attach.x)}, ${fmt(attach.y)})  rot:${fmt(c.rotation())}\n`;
+      .panel.right {
+        border-right: none;
+        border-left: 1px solid var(--border);
       }
-      out += `\nStrings (abs endpoints):\n`;
-      for (const l of links) {
-        const { p1, p2 } = l.getEndpointsAbs();
-        out += `  ${String(l.name).padEnd(12)}  p1(${fmt(p1.x)}, ${fmt(p1.y)}) → p2(${fmt(p2.x)}, ${fmt(p2.y)})\n`;
+
+      .panel.middle {
+        position: relative;
+        display: grid;
+        grid-template-rows: 100%;
+        grid-template-columns: 100%;
+        overflow: hidden;
+        color: inherit;
+        background: var(--bg);
+        /* keep canvas area dark */
       }
-      metricsPre.textContent = out;
-    }
 
-    // ---------------- Continuous sync ----------------
-    const anim = new Konva.Animation(() => {
-      // Recompute lines and endpoints
-      for (const l of links) l.update();
-      // Update visible card pins (position + inverse scale)
-      for (const c of cards) c.updatePinOverlay();
-      renderMetrics();
+      #konvaMount {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
 
-      // Explicitly redraw the two endpoint layers since their nodes are updated here
-      endpointEndsLayer.batchDraw();
-      endpointPinsLayer.batchDraw();
-    }, stringLayer);
-    anim.start();
+      .stack {
+        padding: 12px;
+        display: grid;
+        gap: 12px;
+      }
 
-    // ---------------- Resize handling ----------------
-    function resize() {
-      stage.size({ width: container.clientWidth, height: container.clientHeight });
-      drawGrid();
-      stage.draw();
-    }
-    window.addEventListener('resize', resize);
+      .card {
+        background: #f7f1e6;
+        border: 1px solid #c7a983;
+        border-radius: 8px;
+        padding: 10px;
+        display: grid;
+        gap: 8px;
+      }
 
-    // ---------------- Initial paint ----------------
-    stage.draw();
-  </script>
-</body>
+      .card h3 {
+        margin: 0 0 4px;
+        font-size: 13px;
+        color: #2a2621;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .row input[type="color"] {
+        width: 40px;
+        height: 24px;
+        padding: 0;
+        border: 0;
+        background: none;
+      }
+
+      .row input[type="number"],
+      .row select {
+        width: 140px;
+      }
+
+      .row input[readonly] {
+        background: #f1e7d7;
+        border: 1px solid #c7a983;
+        border-radius: 4px;
+        padding: 4px 6px;
+      }
+
+      .row input[type="checkbox"] {
+        transform: translateY(1px);
+      }
+
+      .tight {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+    </style>
+    <!-- noUiSlider (global) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15.8.1/dist/nouislider.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/nouislider@15.8.1/dist/nouislider.min.js"></script>
+  </head>
+  <body>
+    <header>Header (5% height)</header>
+    <div class="main">
+      <!-- LEFT: Global settings -->
+      <aside class="panel left">
+        <div class="stack">
+          <div class="card">
+            <h3>World</h3>
+            <div class="row">
+              <label for="worldTopColor">Top</label>
+              <input id="worldTopColor" type="color" value="#0f1418">
+            </div>
+            <div class="row">
+              <label for="worldBottomColor">Bottom</label>
+              <input id="worldBottomColor" type="color" value="#0b0f13">
+            </div>
+            <div class="row">
+              <label for="worldStrokeColor">Border</label>
+              <input id="worldStrokeColor" type="color" value="#2a3238">
+            </div>
+          </div>
+          <div class="card">
+            <h3>Grid</h3>
+            <div class="row">
+              <label for="gridToggle">Show Grid</label>
+              <input id="gridToggle" type="checkbox" checked>
+            </div>
+            <div class="row">
+              <label for="gridLightColor">Light</label>
+              <input id="gridLightColor" type="color" value="#1c242a">
+            </div>
+            <div class="row">
+              <label for="gridHeavyColor">Heavy</label>
+              <input id="gridHeavyColor" type="color" value="#2f3a41">
+            </div>
+            <div class="row">
+              <label for="gridSpacing">Spacing</label>
+              <input id="gridSpacing" type="number" min="10" step="10" value="100">
+            </div>
+            <div class="row">
+              <label for="gridMajorEvery">Major Every</label>
+              <input id="gridMajorEvery" type="number" min="50" step="50" value="500">
+            </div>
+          </div>
+          <div class="card">
+            <h3>Card Shadow (Global)</h3>
+            <div class="row">
+              <label for="shadowEnabled">Enabled</label>
+              <input id="shadowEnabled" type="checkbox" checked>
+            </div>
+            <div class="row">
+              <label for="shadowDx">Offset X</label>
+              <input id="shadowDx" type="number" step="1" value="6">
+            </div>
+            <div class="row">
+              <label for="shadowDy">Offset Y</label>
+              <input id="shadowDy" type="number" step="1" value="6">
+            </div>
+            <div class="row">
+              <label for="shadowBlur">Blur</label>
+              <input id="shadowBlur" type="number" min="0" step="1" value="12">
+            </div>
+            <div class="row">
+              <label for="shadowOpacity">Opacity</label>
+              <input id="shadowOpacity" type="number" min="0" max="1" step="0.05" value="0.35">
+            </div>
+            <div class="row">
+              <label for="shadowColor">Color</label>
+              <input id="shadowColor" type="color" value="#000000">
+            </div>
+          </div>
+        </div>
+      </aside>
+      <!-- MIDDLE: Canvas -->
+      <section class="panel middle">
+        <div id="konvaMount"></div>
+      </section>
+      <!-- RIGHT: Local controls & selection tracking -->
+      <aside class="panel right">
+        <div class="stack">
+          <div class="card">
+            <h3>View</h3>
+            <div class="row">
+              <button id="recenterBtn" style="padding:8px; border:1px solid #273036; border-radius:6px; background:#dba368; cursor:pointer;"> Recenter (3000,3000) </button>
+              <span></span>
+            </div>
+            <div class="row" style="align-items:center; gap:8px;">
+              <div class="tight">
+                <button id="zoomMinusBtn" title="Down to next 10%" style="padding:8px 12px; border:1px solid #273036; border-radius:6px; background:#dba368; cursor:pointer;">−</button>
+              </div>
+              <div id="zoomSlider" style="flex:1; margin:0 2px; min-width: 160px;"></div>
+              <div class="tight">
+                <button id="zoomPlusBtn" title="Up to next 10% (≤ 490%)" style="padding:8px 12px; border:1px solid #273036; border-radius:6px; background:#dba368; cursor:pointer;">+</button>
+              </div>
+            </div>
+            <div style="text-align:right; opacity:.8;">Zoom: <b id="zoomPct">100%</b>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Selection</h3>
+            <div class="row">
+              <label for="selCard">Card</label>
+              <select id="selCard"></select>
+            </div>
+            <div class="row">
+              <label>Status</label>
+              <span id="selStatus">idle</span>
+            </div>
+            <div class="row">
+              <label for="selCx">cx</label>
+              <input id="selCx" type="number" readonly>
+            </div>
+            <div class="row">
+              <label for="selCy">cy</label>
+              <input id="selCy" type="number" readonly>
+            </div>
+            <div class="row">
+              <label for="selW">w</label>
+              <input id="selW" type="number" readonly>
+            </div>
+            <div class="row">
+              <label for="selH">h</label>
+              <input id="selH" type="number" readonly>
+            </div>
+            <div class="row">
+              <label for="selRot">rot</label>
+              <input id="selRot" type="number" readonly>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+    <!-- App entry (ES module) -->
+    <script type="module" src="./src/main.js"></script>
+  </body>
 </html>
