@@ -361,6 +361,103 @@ export class Board {
     }
   }
 
+  // -- NEW: build/replace the styled body+header via cardStyles.js --
+  _buildCardSkin(node, model) {
+    const styleFn = cardStyles[model.styleKey] || cardStyles.default;
+
+    const safeStyle = {
+      w: model.w,
+      h: model.h,
+      stroke: model.stroke ?? '#3b4a52',
+      strokeWidth: model.strokeWidth ?? 2,
+      bodyFill: model.bodyFill ?? '#1b2126',
+      headerFill: model.headerFill ?? '#0f1317',
+    };
+
+    // create skin (Group named 'cardGroup', containing .body + .header)
+    const skin = styleFn(safeStyle);
+    skin.name('cardGroup');
+    // apply shadow on body
+    const body = skin.findOne('.body');
+    if (body) this._applyShadowToBody(body);
+
+    // insert skin first (bottom)
+    node.add(skin);
+
+    // ensure title & image nodes exist (or create them)
+    let title = node.findOne('.title');
+    let img   = node.findOne('.img');
+    let frame = node.findOne('.imgFrame');
+
+    const header = skin.findOne('.header');
+    const headerH = header?.height() ?? 26;
+    const imgSize = 70;
+    const imgX = 12;
+    const imgY = headerH + 10;
+
+    if (!img) {
+      img = new Konva.Image({
+        name: 'img',
+        x: imgX, y: imgY, width: imgSize, height: imgSize,
+        listening: false, visible: false
+      });
+      node.add(img);
+    } else {
+      img.position({ x: imgX, y: imgY });
+      img.size({ width: imgSize, height: imgSize });
+    }
+
+    if (!frame) {
+      frame = new Konva.Rect({
+        name: 'imgFrame',
+        x: imgX, y: imgY, width: imgSize, height: imgSize,
+        cornerRadius: 6,
+        stroke: '#2d3741',
+        strokeWidth: 1,
+        listening: false
+      });
+      frame.fillEnabled(false); // border-only so it never hides the image
+      node.add(frame);
+    } else {
+      frame.position({ x: imgX, y: imgY });
+      frame.size({ width: imgSize, height: imgSize });
+      frame.fillEnabled(false);
+      frame.listening(false);
+    }
+
+    if (!title) {
+      title = new Konva.Text({
+        name: 'title',
+        x: 12, y: 6, width: model.w - 24, height: (headerH - 8),
+        text: model.title ?? model.id,
+        fontFamily: 'ui-monospace, monospace', fontSize: 14, fill: '#cfe3d0', listening: false,
+        align: 'left', verticalAlign: 'middle',
+      });
+      node.add(title);
+    } else {
+      title.position({ x: 12, y: 6 });
+      title.width(model.w - 24);
+      title.height(headerH - 8);
+      title.text(model.title ?? model.id);
+    }
+
+    // Keep draw order clear: skin (bottom) -> frame -> img -> title
+    // (frame has no fill, so even if above img it won’t hide it)
+    skin.zIndex(0);
+    frame.zIndex(1);
+    img.zIndex(2);
+    title.zIndex(3);
+
+    // (re)load image if URL present
+    this._setCardImage(node, model.img);
+  }
+
+  _rebuildCardSkin(node, model) {
+    const old = node.findOne('.cardGroup');
+    if (old) old.destroy();
+    this._buildCardSkin(node, model);
+  }
+
   _upsertCard(model) {
     const prev = this.SHAPES.get(model.id);
     const next = { kind: 'card', ...prev, ...model };
@@ -392,57 +489,8 @@ export class Board {
       node.setAttr('shapeId', next.id);
       node.setAttr('shapeKind', 'card');
 
-      // BODY + header + text + image
-      const body = new Konva.Rect({
-        name: 'body',
-        x: 0, y: 0, width: next.w, height: next.h,
-        cornerRadius: this._cornerRadiusForStyle(next.styleKey, next.w, next.h),
-        fillLinearGradientStartPoint: { x: 0, y: 0 },
-        fillLinearGradientEndPoint:   { x: 0, y: next.h },
-        fillLinearGradientColorStops: [0, next.bodyFill ?? '#1b2126', 1, '#11161a'],
-        stroke: next.stroke ?? '#3b4a52',
-        strokeWidth: next.strokeWidth ?? 2
-      });
-      this._applyShadowToBody(body);
-
-      const headerH = 26;
-      const header = new Konva.Rect({
-        name: 'header',
-        x: 0, y: 0, width: next.w, height: headerH,
-        cornerRadius: this._headerCornerRadiusForStyle(next.styleKey, next.w, headerH),
-        fill: next.headerFill ?? '#0f1317'
-      });
-
-      const title = new Konva.Text({
-        name: 'title',
-        text: next.title ?? next.id,
-        x: 12, y: 5, width: next.w - 24, height: headerH - 8,
-        fontFamily: 'ui-monospace, monospace', fontSize: 14, fill: '#cfe3d0', listening: false
-      });
-
-      const imgSize = 70;
-      const imgRect = new Konva.Rect({
-        name: 'imgFrame',
-        x: 12, y: headerH + 10, width: imgSize, height: imgSize,
-        cornerRadius: 6, stroke: '#2d3741', strokeWidth: 1, fill: '#0d1115'
-      });
-      
-      node.add(body, header, title, imgRect);
-      
-      if (next.img) {
-        // Load the image asynchronously
-        const image = new Image();
-        image.src = next.img;
-        image.onload = () => {
-          const cardImage = new Konva.Image({
-            image: image,
-            x: 12, y: headerH + 10, width: imgSize, height: imgSize,
-            listening: false // important: don't let it block clicks on the card
-          });
-          node.add(cardImage);
-          this.layer.batchDraw();
-        };
-      }
+      // Build the styled skin (body+header) + title + image via helpers
+      this._buildCardSkin(node, next);
 
       if (typeof next.rot === 'number') node.rotation(next.rot);
 
@@ -484,54 +532,35 @@ export class Board {
       this.groups.cards.add(node);
       this.SHAPE_NODES.set(next.id, node);
 
-      // Respect incoming z (place at index). We can use zIndex or reorder:
+      // Respect incoming z (place at index)
       if (typeof next.z === 'number') node.zIndex(next.z);
 
     } else {
       // update existing
+      const sizeChanged = (next.w !== prev.w) || (next.h !== prev.h);
+      const styleChanged = next.styleKey !== prev?.styleKey
+        || next.stroke !== prev?.stroke
+        || next.strokeWidth !== prev?.strokeWidth
+        || next.bodyFill !== prev?.bodyFill
+        || next.headerFill !== prev?.headerFill;
+
       node.position({ x: next.cx, y: next.cy });
       if (typeof next.rot === 'number') node.rotation(next.rot);
 
-      const body   = node.findOne('.body');
-      const header = node.findOne('.header');
-      const title  = node.findOne('.title');
-
-      const sizesChanged = (body?.width() !== next.w) || (body?.height() !== next.h);
-      if (sizesChanged) {
-        body?.width(next.w); body?.height(next.h);
-        body?.cornerRadius(this._cornerRadiusForStyle(next.styleKey, next.w, next.h));
-        header?.width(next.w);
-        header?.cornerRadius(this._headerCornerRadiusForStyle(next.styleKey, next.w, 26));
-        title?.width(next.w - 24);
+      if (sizeChanged || styleChanged) {
         node.offset({ x: next.w/2, y: next.h/2 });
-
-        const p = this._clampCardCenter(node.x(), node.y(), next.w, next.h);
-        node.position({ x: p.cx, y: p.cy });
-        next.cx = p.cx; next.cy = p.cy;
+        this._rebuildCardSkin(node, next);
+      } else {
+        // minor updates
+        const title = node.findOne('.title');
+        if (title && next.title != null) title.text(next.title);
+        // if image URL changed, reload
+        this._setCardImage(node, next.img);
       }
-
-      if (body) {
-        if (next.stroke) body.stroke(next.stroke);
-        if (next.strokeWidth != null) body.strokeWidth(next.strokeWidth);
-        this._applyShadowToBody(body);
-      }
-
-      if (title && next.title != null) title.text(next.title);
 
       // z update if requested
       if (typeof next.z === 'number') node.zIndex(next.z);
     }
-  }
-
-  _cornerRadiusForStyle(styleKey, w, h) {
-    if (styleKey === 'sharp') return 0;
-    if (styleKey === 'bottomRounded') return [0,0,10,10];
-    return 10; // standard
-  }
-  _headerCornerRadiusForStyle(styleKey, w, h) {
-    if (styleKey === 'sharp') return 0;
-    if (styleKey === 'bottomRounded') return [0,0,0,0];
-    return [10,10,0,0];
   }
 
   _removeShape(id) {
@@ -763,6 +792,46 @@ export class Board {
         this._animatePanTo(this.CFG.world.width / 2, this.CFG.world.height / 2)
       );
     }
+  }
+
+  // image fitting/centering inside the 70x70 slot
+  _setCardImage(node, url) {
+    const imgNode = node.findOne('.img');
+    const frame   = node.findOne('.imgFrame');
+    if (!imgNode || !frame) return;
+
+    if (!url) {
+      imgNode.visible(false);
+      imgNode.image(null);
+      return;
+    }
+
+    const targetW = frame.width();
+    const targetH = frame.height();
+
+    const img = new window.Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const scale = Math.min(targetW / img.width, targetH / img.height);
+      const drawW = img.width * scale;
+      const drawH = img.height * scale;
+
+      imgNode.image(img);
+      imgNode.width(drawW);
+      imgNode.height(drawH);
+      imgNode.position({
+        x: frame.x() + (targetW - drawW) / 2,
+        y: frame.y() + (targetH - drawH) / 2,
+      });
+      imgNode.visible(true);
+      this.layer.batchDraw();
+    };
+    img.onerror = () => {
+      imgNode.visible(false);
+      imgNode.image(null);
+      this.layer.batchDraw();
+    };
+    img.src = url;
   }
 }
 
